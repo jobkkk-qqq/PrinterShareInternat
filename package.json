@@ -1,0 +1,44 @@
+{
+  "name": "printer-share",
+  "version": "0.2.0",
+  "description": "原始TCP(9100)打印服务器 + 系统托盘：转发到本机打印机，含队列管理与客户端一键安装脚本",
+  "author": "printer-share",
+  "main": "main.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server.js",
+    "make-icon": "node make-icon.js",
+    "postinstall": "node make-icon.js",
+    "electron": "electron .",
+    "build": "node make-icon.js && build.bat"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "org.printshare.app",
+    "productName": "PrintShare",
+    "asar": false,
+    "files": [
+      "main.js",
+      "server.js",
+      "winspool.ps1",
+      "make-icon.js",
+      "public/**/*",
+      "tray-icon.png",
+      "icon.png",
+      "icon.ico",
+      "config.json",
+      "queue"
+    ],
+    "win": {
+      "target": [
+        { "target": "portable", "arch": ["x64", "ia32"] }
+      ],
+      "icon": "icon.ico",
+      "requestedExecutionLevel": "asInvoker",
+      "signAndEditExecutable": false
+    }
+  }
+}

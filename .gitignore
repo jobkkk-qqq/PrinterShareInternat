@@ -1,0 +1,21 @@
+# 依赖与构建产物
+node_modules/
+dist/
+.buildcache/
+.electron-cache/
+.npmcache/
+.eu/
+.trae-html-share-packages/
+
+# 日志
+*.log
+.npm-install.log
+
+# 运行期数据（打印任务队列、本机配置——含机器名/打印机名）
+queue/*
+!queue/.gitkeep
+config.json
+
+# 旧版客户端脚本（含本机 IP，已由运行期生成的纯 BAT 单文件取代）
+client-install.ps1
+安装共享打印机.bat

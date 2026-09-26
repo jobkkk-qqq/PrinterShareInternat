@@ -32,9 +32,12 @@ function psCmd(cmd) { return PS_UTF8 + cmd; }
 // 队列与配置若写在 __dirname 下会每次重启就丢。因此打包运行时改放 %APPDATA%\PrintShare；
 // 源码方式运行（npm start / npm run electron / 测试）仍用项目目录，行为不变。
 const PACKAGED = !!(process.env.PORTABLE_EXECUTABLE_DIR || process.env.PORTABLE_EXECUTABLE_FILE);
-const DATA_ROOT = PACKAGED
-  ? path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'PrintShare')
-  : __dirname;
+// PRINTSHARE_DATA_DIR 可显式指定数据目录（自动化测试的隔离目录、想把队列放别的盘都用它）
+const DATA_ROOT = process.env.PRINTSHARE_DATA_DIR
+  ? path.resolve(process.env.PRINTSHARE_DATA_DIR)
+  : (PACKAGED
+    ? path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'PrintShare')
+    : __dirname);
 
 const QUEUE_DIR = path.join(DATA_ROOT, 'queue');
 const META_FILE = path.join(QUEUE_DIR, 'meta.json');
@@ -42,6 +45,9 @@ const META_FILE = path.join(QUEUE_DIR, 'meta.json');
 const CONFIG = {
   rawPort: Number(process.env.RAW_PORT) || 9100,
   adminPort: Number(process.env.ADMIN_PORT) || 8081,
+  // 管理页默认只监听本机回环：不碰防火墙、局域网内别的电脑也打不开（打印端口 9100 不受影响）。
+  // 确实需要从别的电脑打开管理页时，设 ADMIN_BIND=0.0.0.0（此时会自动放行 8081 防火墙）。
+  adminBind: process.env.ADMIN_BIND || '127.0.0.1',
   configFile: path.join(DATA_ROOT, 'config.json'),
 };
 
@@ -65,8 +71,11 @@ async function ensureFirewall() {
   if (DRYRUN) return; // 测试模式不弹 UAC
   const rules = [
     { name: 'PrintShare 9100', port: CONFIG.rawPort },
-    { name: `PrintShare Admin ${CONFIG.adminPort}`, port: CONFIG.adminPort },
   ];
+  // 管理页只监听回环地址时不需要（也不应该）对外放行防火墙
+  if (!/^(127\.|localhost$)/i.test(CONFIG.adminBind)) {
+    rules.push({ name: `PrintShare Admin ${CONFIG.adminPort}`, port: CONFIG.adminPort });
+  }
   const missing = [];
   for (const r of rules) if (await firewallRuleMissing(r.name)) missing.push(r);
   if (!missing.length) return; // 都已放行
@@ -84,6 +93,15 @@ async function ensureFirewall() {
 
 function ensureDirs() { fs.mkdirSync(QUEUE_DIR, { recursive: true }); }
 
+// 进程被强杀/断电会留下接收中的 .ing 半截文件（从未入队），启动时清掉，免得越积越多
+function cleanOrphanIngest() {
+  try {
+    for (const f of fs.readdirSync(QUEUE_DIR)) {
+      if (f.endsWith('.ing')) fs.unlink(path.join(QUEUE_DIR, f), () => {});
+    }
+  } catch (_) { /* 目录不存在等，忽略 */ }
+}
+
 function loadState() {
   try {
     const c = JSON.parse(fs.readFileSync(CONFIG.configFile, 'utf8'));
@@ -95,8 +113,14 @@ function loadState() {
     jobs = Array.isArray(m.jobs) ? m.jobs : [];
     globalPaused = !!m.paused;
     seq = m.seq || 0;
-    // 重启后没有"正在打印"的任务，统一回到排队中等待重新投递
-    jobs.forEach((j) => { if (j.status === 'printing') { j.status = 'queued'; j.startedAt = null; } });
+    jobs.forEach((j) => {
+      // 重启后没有"正在打印"的任务，统一回到排队中等待重新投递
+      if (j.status === 'printing') { j.status = 'queued'; j.startedAt = null; }
+      // 数据文件不在（被误删/磁盘故障）就别再投递了，标记失败让人看得见
+      if (j.status === 'queued' && (!j.file || !fs.existsSync(j.file))) {
+        j.status = 'failed'; j.error = '数据文件丢失'; j.finishedAt = j.finishedAt || Date.now();
+      }
+    });
   } catch (_) { jobs = []; }
 }
 
@@ -112,13 +136,17 @@ function persistConfig() {
   } catch (e) { console.error('保存配置失败:', e.message); }
 }
 
+// DRYRUN=1（联调/自动化测试）下所有查询都返回固定值：不起 PowerShell、不依赖 WMI，
+// 于是"没装打印机、没权限"的机器上也能完整跑通队列流程。
 async function listPrinters() {
+  if (DRYRUN) return ['[DRYRUN] Virtual Printer'];
   try {
     const { stdout } = await execFileP(PS, PS_OPTS.concat(['-Command', psCmd('Get-Printer | ForEach-Object { $_.Name }')]), { maxBuffer: 1e6 });
     return stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
   } catch (_) { return []; }
 }
 async function defaultPrinter() {
+  if (DRYRUN) return null;
   try {
     const { stdout } = await execFileP(PS, PS_OPTS.concat(['-Command', psCmd('(Get-CimInstance Win32_Printer -Filter "Default=$true").Name')]), { maxBuffer: 1e6 });
     return stdout.trim() || null;
@@ -140,9 +168,10 @@ async function cachedPrinters() {
 }
 async function cachedDefaultPrinter() {
   const now = Date.now();
-  if (defCache && now - defCacheAt < CACHE_TTL) return defCache;
-  const d = await defaultPrinter();
-  if (d != null) { defCache = d; defCacheAt = now; }
+  // 负结果也要缓存：没有默认打印机时，原来每 2.5s 刷新一次管理页就起一个 PowerShell
+  if (now - defCacheAt < CACHE_TTL) return defCache;
+  defCache = await defaultPrinter();
+  defCacheAt = now;
   return defCache;
 }
 
@@ -154,7 +183,7 @@ async function cachedDefaultPrinter() {
 // 在 Win7 cmd 下解析错乱甚至闪退。用队列名作参数，靠 env 传递避免引号/编码问题。
 const drvModelCache = new Map();
 async function printerDriverModel(queueName) {
-  if (!queueName) return null;
+  if (!queueName || DRYRUN) return null;
   if (drvModelCache.has(queueName)) return drvModelCache.get(queueName);
   let model = null;
   try {
@@ -237,9 +266,12 @@ async function pump() {
 
       if (!job.printer) job.printer = targetPrinter || (await defaultPrinter());
       if (!job.printer) {
-        job.status = 'failed'; job.error = '未设置共享打印机'; job.finishedAt = Date.now();
-        persist(); console.error(`[队列] 任务#${job.seq} 失败：未设置打印机`);
-        continue;
+        // 不要直接判失败：任务数据还在，用户在管理页选好打印机后（/api/printer 会调用
+        // pump）自动继续。判失败会让"还没选打印机"这段时间收到的作业直接丢件。
+        job.error = '尚未设置共享打印机，等待在管理页选择';
+        persist();
+        console.warn(`[队列] 尚未设置共享打印机，任务#${job.seq} 保持排队，选择打印机后会自动继续`);
+        break;
       }
 
       job.status = 'printing'; job.startedAt = Date.now(); persist();
@@ -273,7 +305,15 @@ function enqueue(socket) {
     if (head.length < HEAD_SCAN) head = Buffer.concat([head, c.slice(0, HEAD_SCAN - head.length)]);
     w.write(c); // 流式写盘，不占用内存缓冲
   });
-  socket.on('error', (e) => { console.error('TCP 错误:', e.message); closed = true; w.destroy(); fs.unlink(ingest, () => {}); });
+  socket.on('error', (e) => {
+    console.error('TCP 错误:', e.message);
+    if (closed) return;
+    closed = true;
+    w.destroy();
+    // 必须等写入流真正关闭再删：Windows 上文件仍被占用时 unlink 会直接失败，
+    // 半截 .ing 文件就会永远留在磁盘上（客户端中途取消打印时很常见）。
+    w.once('close', () => fs.unlink(ingest, () => {}));
+  });
   socket.on('end', () => {
     if (closed) return;
     closed = true;
@@ -304,7 +344,25 @@ function enqueue(socket) {
 
 const tcpServer = net.createServer(enqueue);
 tcpServer.listen(CONFIG.rawPort, () => console.log(`[打印] 0.0.0.0:${CONFIG.rawPort}  客户端请用 主机IP:${CONFIG.rawPort}`));
-tcpServer.on('error', (e) => { console.error(`无法监听 ${CONFIG.rawPort}：`, e.message); process.exit(1); });
+tcpServer.on('error', (e) => {
+  console.error(`无法监听 ${CONFIG.rawPort}：`, e.message);
+  let hint = '';
+  if (e.code === 'EADDRINUSE') {
+    hint = `端口 ${CONFIG.rawPort} 已被其它程序占用（也可能是本程序已经在运行）。` +
+      `可用环境变量 RAW_PORT 换一个端口后重试。`;
+    console.error(hint);
+  }
+  // 托盘（打包）模式下没有任何控制台，静默退出等于"双击了没反应"，弹个框说明原因
+  if (process.versions.electron) {
+    try {
+      const { dialog, app } = require('electron');
+      dialog.showErrorBox('PrintShare 无法启动', hint || e.message);
+      app.quit();
+      return;
+    } catch (_) { /* 非 GUI 环境，走下面的 exit */ }
+  }
+  process.exit(1);
+});
 
 // ---------- 管理页 / API ----------
 function sendJson(res, obj, code) { res.writeHead(code || 200, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); }
@@ -336,6 +394,7 @@ function serverIPs() {
 let preferredCache = null;
 let preferredAt = 0;
 async function preferredHostIP() {
+  if (DRYRUN) return serverIPs()[0] || '127.0.0.1';
   const now = Date.now();
   if (preferredCache && now - preferredAt < 15000) return preferredCache;
   let best = null;
@@ -494,6 +553,9 @@ function buildClientScript(host, portNum, driver) {
   // 存在性/可达性检查用 WMI(Get-WmiObject) 与 Net.Sockets.TcpClient —— Win7 的 PowerShell 2.0 就具备。
   // 安全：无 Base64、无全局 ExecutionPolicy 绕过、提权仅在确需建打印机时触发（自提权重进 elev 分支）、
   //   删除前先询问且只删本脚本命名的对象、创建端口前先验证服务器 TCP 可达。
+  // 换行统一：先把源码里的 \r\n（Windows 检出）归一到 \n，再一次性转成 \r\n。
+  // 直接 replace(/\n/g, '\r\n') 会把源码里本来就有的 CRLF 变成 \r\r\n，
+  // 而 Windows 批处理对行尾多出来的 CR 很敏感。
   const bat = String.raw`@echo off
 setlocal EnableExtensions
 title Network Printer Installer (Safe Mode)
@@ -667,7 +729,7 @@ exit /b 1
 echo   [FAILED] Printer configuration was not applied. See errors above and retry;
 echo   original configuration was preserved as much as possible.
 pause
-exit /b 1`.replace(/\n/g, '\r\n');
+exit /b 1`.replace(/\r\n|\r/g, '\n').replace(/\n/g, '\r\n');
 
   return { bat, ps1Name: null, batName: '安装共享打印机.bat', ps1: null };
 }
@@ -742,6 +804,25 @@ const adminServer = http.createServer(async (req, res) => {
   const url = (req.url || '').split('?')[0];
   const method = req.method;
 
+  // 管理页没有登录态，"谁能访问 8081"就等于"谁是管理员"。为了不让浏览器里的任意
+  // 网页对 localhost:8081 发起跨站写操作，非 GET 请求必须满足：
+  //   1) Content-Type 为 application/json（表单/纯文本的跨站提交直接被拒）
+  //   2) 若带 Origin，则必须来自本机或管理端口本身
+  if (method !== 'GET' && method !== 'HEAD') {
+    if (!String(req.headers['content-type'] || '').includes('application/json')) {
+      return sendJson(res, { ok: false, reason: '仅接受 application/json 请求' }, 415);
+    }
+    const origin = req.headers.origin;
+    if (origin) {
+      let fromAdmin = false;
+      try {
+        const o = new URL(origin);
+        fromAdmin = o.hostname === 'localhost' || o.hostname === '127.0.0.1' || o.port === String(CONFIG.adminPort);
+      } catch (_) { fromAdmin = false; }
+      if (!fromAdmin) return sendJson(res, { ok: false, reason: '跨站请求被拒绝' }, 403);
+    }
+  }
+
   if (url === '/' || url === '/index.html') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(fs.readFileSync(path.join(__dirname, 'public', 'index.html')));
@@ -793,10 +874,14 @@ const adminServer = http.createServer(async (req, res) => {
 
   if (url === '/api/clear-done' && method === 'POST') {
     const finished = ['done', 'failed', 'cancelled'];
+    // 先取出"要清掉的"任务再过滤，最后只删这些任务的数据文件。
+    // （曾经写成对过滤后的数组 unlink：那正好是保留下来的任务，会把排队中/打印中
+    //   任务的 .pcl 删掉，队列里留下永远打不出来的空任务。）
+    const removed = jobs.filter((j) => finished.includes(j.status));
     jobs = jobs.filter((j) => !finished.includes(j.status));
-    jobs.forEach((j) => fs.unlink(j.file, () => {}));
+    removed.forEach((j) => fs.unlink(j.file, () => {}));
     persist();
-    return sendJson(res, { ok: true });
+    return sendJson(res, { ok: true, removed: removed.length });
   }
 
   const m = url.match(/^\/api\/jobs\/([^/]+)\/(cancel|pause|priority)$/);
@@ -847,13 +932,23 @@ const adminServer = http.createServer(async (req, res) => {
   res.writeHead(404); res.end('Not Found');
 });
 
-adminServer.listen(CONFIG.adminPort, () => console.log(`[管理] http://localhost:${CONFIG.adminPort}`));
+adminServer.listen(CONFIG.adminPort, CONFIG.adminBind, () => console.log(`[管理] http://localhost:${CONFIG.adminPort}（监听 ${CONFIG.adminBind}）`));
+// 管理页起不来不该连带打印服务一起死：打印端口才是关键路径
+adminServer.on('error', (e) => {
+  if (e.code === 'EADDRINUSE') {
+    console.error(`[管理] 端口 ${CONFIG.adminPort} 已被占用，管理页不可用（打印服务不受影响）。可用 ADMIN_PORT 环境变量换端口。`);
+  } else {
+    console.error('[管理] 服务启动失败：', e.message);
+  }
+});
 
 // ---------- 启动 ----------
 ensureDirs();
+cleanOrphanIngest();
 loadState();
 pump(); // 重启后继续处理队列里未完成的任务
 ensureFirewall(); // 自动放行防火墙（首次运行会弹一次 UAC）
 if (DRYRUN) console.log('[提示] DRYRUN=1：只走队列流程，不真正打印');
 
-module.exports = { buildClientScript, brandOf, tipBlock, scanJobLanguage, stripJobLanguage, langFlags };
+// tcpServer / adminServer 也导出：自动化测试要能在同一个进程里把服务关掉
+module.exports = { buildClientScript, brandOf, tipBlock, scanJobLanguage, stripJobLanguage, langFlags, tcpServer, adminServer };

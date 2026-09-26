@@ -27,11 +27,10 @@ if errorlevel 1 (
   echo [Firewall] TCP 9100 already allowed
 )
 
-netsh advfirewall firewall show rule name="PrintShare Admin 8081" >nul 2>nul
-if errorlevel 1 (
-  netsh advfirewall firewall add rule name="PrintShare Admin 8081" dir=in action=allow protocol=TCP localport=8081 >nul 2>nul
-  if errorlevel 1 ( echo [Firewall] Failed to allow TCP 8081 ^(sharing still works; only the remote admin page is blocked^) ) else echo [Firewall] TCP 8081 allowed ^(admin page^)
-)
+REM The admin page (TCP 8081) listens on 127.0.0.1 only, so it needs no firewall rule
+REM and cannot be opened from other PCs. To manage it remotely, run with
+REM   set ADMIN_BIND=0.0.0.0
+REM and allow TCP 8081 in Windows Firewall yourself.
 
 echo.
 echo [Service] Starting... the admin page opens at http://localhost:8081 in 2 seconds

@@ -1,12 +1,13 @@
 {
   "name": "printer-share",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "原始TCP(9100)打印服务器 + 系统托盘：转发到本机打印机，含队列管理与客户端一键安装脚本",
   "author": "printer-share",
   "main": "main.js",
   "license": "MIT",
   "scripts": {
     "start": "node server.js",
+    "test": "node --test",
     "make-icon": "node make-icon.js",
     "postinstall": "node make-icon.js",
     "electron": "electron .",
@@ -28,8 +29,7 @@
       "public/**/*",
       "tray-icon.png",
       "icon.png",
-      "icon.ico",
-      "config.json"
+      "icon.ico"
     ],
     "win": {
       "target": [

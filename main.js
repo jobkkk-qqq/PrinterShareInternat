@@ -29,7 +29,9 @@ function startupExe() {
 async function startupEnabled() {
   try {
     const { stdout } = await execFileP('reg', ['query', RUN_KEY, '/v', RUN_VALUE]);
-    return stdout.trim().length > 0;
+    // 注册表里有值不等于指向当前这份 exe：便携版换目录/换盘符后旧路径就失效了。
+    // 顺带比对一下路径，过期时返回 false，用户点一下复选框即可重写成当前路径。
+    return stdout.toLowerCase().includes(startupExe().toLowerCase());
   } catch (_) { return false; }
 }
 
@@ -43,6 +45,16 @@ async function setStartup(enable) {
     return true;
   } catch (_) { return false; }
 }
+
+// ---------- 单实例 ----------
+// 便携版把队列与配置放在 %APPDATA%\PrintShare：两份实例同时写 meta.json 会互相覆盖，
+// 而且第二个实例还会因 TCP 端口被占用直接退出（表现为"双击了没反应"）。
+// 第二份实例只唤起已运行实例的管理页，自身退出。
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+  return; // CommonJS 顶层 return：后面的打印服务与托盘都不再初始化
+}
+app.on('second-instance', () => { shell.openExternal(ADMIN_URL); });
 
 // 启动打印服务（server.js 启动即开始监听，并处理队列）
 require('./server.js');
@@ -67,7 +79,10 @@ function api(method, urlPath, body) {
     const data = body ? JSON.stringify(body) : null;
     const req = http.request({
       host: 'localhost', port: ADMIN_PORT, path: urlPath, method,
-      headers: data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } : {},
+      // 服务端拒绝非 JSON 的写请求（防跨站），这里没有 body 也要带上类型
+      headers: data
+        ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+        : { 'Content-Type': 'application/json' },
     }, (res) => {
       let d = '';
       res.on('data', (c) => (d += c));

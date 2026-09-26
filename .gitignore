@@ -4,7 +4,7 @@ dist/
 .buildcache/
 .electron-cache/
 .npmcache/
-.eu/
+.env
 .trae-html-share-packages/
 
 # 日志

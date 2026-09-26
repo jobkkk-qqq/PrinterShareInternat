@@ -70,7 +70,12 @@ try {
   # 合法任务头。对 RAW 打印语言，任务开头的 0 是纯垃圾，直接剔除更稳。
   $trimStart = 0
   while ($trimStart -lt $raw.Length -and $raw[$trimStart] -eq 0) { $trimStart++ }
-  if ($trimStart -gt 0) {
+  if ($trimStart -ge $raw.Length) {
+    # 整个任务都是 0x00（极端情况）：$raw[$len..($len-1)] 在 PowerShell 里会反过来取到
+    # 最后一个字节，所以这里显式当成空任务，交给下面的 Length 判断跳过写入。
+    $bytes = [byte[]]@()
+    Write-Output "任务内容全为 0x00，按空任务处理 (原始 $($raw.Length) 字节)"
+  } elseif ($trimStart -gt 0) {
     $bytes = [byte[]]($raw[$trimStart..($raw.Length - 1)])
     Write-Output "已剥离前导 0x00 字节: $trimStart (剩余 $($bytes.Length) 字节)"
   } else {

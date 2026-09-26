@@ -115,6 +115,7 @@
 
 <script>
   var state = { paused:false, printers:[], targetPrinter:null, queue:[], serverIPs:[], preferredIP:null, stripLang:false };
+  var printerTouched = false; // 用户是否手动改过打印机下拉（防止 2.5s 刷新把手选值顶回去）
 
   function $(id){ return document.getElementById(id); }
   function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
@@ -150,11 +151,20 @@
   }
 
   function render(){
-    // 选择器
+    // 选择器：状态每 2.5s 刷新一次，但不能顺手重建下拉——重建会关掉正在展开的列表，
+    // 也会把"已手动选好、还没点保存"的选择恢复成旧值。
     var sel = $('printerSelect');
-    var current = state.targetPrinter || state.defaultPrinter || '';
-    sel.innerHTML = '<option value="">（自动使用系统默认打印机）</option>' +
-      state.printers.map(function(p){ return '<option value="'+esc(p)+'"'+(p===current?' selected':'')+'>'+esc(p)+'</option>'; }).join('');
+    var saved = state.targetPrinter || state.defaultPrinter || '';
+    var opts = '<option value="">（自动使用系统默认打印机）</option>' +
+      state.printers.map(function(p){ return '<option value="'+esc(p)+'">'+esc(p)+'</option>'; }).join('');
+    if (sel.dataset.opts !== opts) { sel.dataset.opts = opts; sel.innerHTML = opts; }
+    var want = saved;
+    if(printerTouched){
+      var v = sel.value;
+      want = (v === '' || state.printers.indexOf(v) >= 0) ? v : saved;
+    }
+    if(want !== '' && state.printers.indexOf(want) < 0) want = ''; // 已保存的打印机已不存在
+    sel.value = want;
     // 服务器 IP 选择
     var ips = (state.serverIPs||[]).slice();
     if(/^(\d{1,3}\.){3}\d{1,3}$/.test(location.hostname) && ips.indexOf(location.hostname)<0) ips.unshift(location.hostname);
@@ -195,7 +205,7 @@
         '<td>#'+j.seq+'</td>' +
         '<td>'+timeOf(j.createdAt)+'</td>' +
         '<td><span title="'+esc(j.from)+'">'+esc(fmtSrc(j.from))+'</span></td>' +
-        '<td>'+esc(j.printer||'—')+' <span class="hint">('+fmtBytes(j.bytes)+')</span></td>' +
+        '<td>'+(j.printer ? esc(j.printer) : '<span class="hint">未选择打印机</span>')+' <span class="hint">('+fmtBytes(j.bytes)+')</span></td>' +
         '<td class="pri">'+j.priority+'</td>' +
         '<td>'+statusPill(j)+langBadge(j)+'</td>' +
         '<td class="ops">'+ops+'</td>' +
@@ -220,6 +230,7 @@
     else if(t.dataset.c) api('/api/jobs/'+t.dataset.c+'/cancel');
   });
   $('applyBtn').addEventListener('click', function(){ api('/api/printer',{name:$('printerSelect').value}); });
+  $('printerSelect').addEventListener('change', function(){ printerTouched = true; });
   $('pauseBtn').addEventListener('click', function(){ api('/api/pause',{paused:!state.paused}); });
   $('clearBtn').addEventListener('click', function(){ api('/api/clear-done'); });
   $('stripBtn').addEventListener('click', function(){ api('/api/strip-lang',{stripLang:!state.stripLang}); });

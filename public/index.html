@@ -67,10 +67,33 @@
     <div class="row">
       <span>服务器IP:</span>
       <select id="ipSelect" style="flex:1;min-width:180px"></select>
-      <span class="hint">使用驱动:</span>
+      <span class="hint">共享打印机:</span>
       <span id="genDriver" class="hint" style="white-space:nowrap"></span>
+      <span class="hint">（脚本内自动换成该打印机的驱动型号名）</span>
       <button class="big" id="genBtn">⬇ 下载 zip 安装包</button>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>驱动协商兼容 <span class="badsmall" id="langCount"></span></h2>
+    <div class="hint" style="margin-bottom:12px">
+      部分驱动会在作业开头插入「作业语言」同步命令。打印机不支持时，这些命令会被当成正文打印出来——纸面出现
+      <code>284.4@EJL</code>（爱普生）、<code>@PJL</code>（HP）等乱码，正文被向下推、版式与本地打印不一致。<br>
+      <b>首选</b>在客户端驱动里关掉对应开关（见下方各品牌排查）；客户端太多、无法逐台修改时，可打开下面的开关，由主机在转发前自动剥离这段前导。
+    </div>
+    <div class="row">
+      <button id="stripBtn" class="ghost">剥离作业语言前导：关</button>
+      <span class="hint">默认关闭。只剥离作业<b>开头</b>的 UEL / @PJL / @EJL 前导块与结尾 UEL，不改动正文；打印机本身支持 PJL 时请勿开启。</span>
+    </div>
+    <details style="margin-top:14px">
+      <summary style="cursor:pointer;color:var(--muted)">各品牌排查方法（点击展开）</summary>
+      <div class="hint" style="margin-top:10px;line-height:1.9">
+        <div><b>爱普生（EJL / 打包模式）</b>：纸面出现 <code>284.4@EJL</code>。客户端「打印机属性 → 设备设置 → 打包模式」设为<b>关</b>；驱动里没有该项时，把打印机缺省设置中的 Packet 模式设为<b>自动</b>。（爱普生 FAQ 310058）</div>
+        <div><b>HP（PJL / UEL）</b>：纸面出现 <code>@PJL</code> 文本。确认打印机支持 PJL，把打印机语言 / Personality 设为 <b>Auto</b>，并优先使用 PCL5/PCL6 或 PostScript 驱动——HP 通用驱动不支持宿主型（host-based）设备。</div>
+        <div><b>佳能（CAPT / UFR II）</b>：官方把「打印乱码」归因为驱动型号选错，请确认装的是本机型的驱动；CAPT 属宿主型驱动、依赖佳能专有数据流，跨 TCP/IP 转发时优先改用 PCL/PS 或 UFR II 驱动。</div>
+        <div><b>通用</b>：客户端「打印机属性 → 端口 → 取消勾选 启用双向支持」。本中继是单向的，双向状态查询只会让打印卡顿。</div>
+      </div>
+    </details>
   </div>
 
   <div class="card">
@@ -91,7 +114,7 @@
 </div>
 
 <script>
-  var state = { paused:false, printers:[], targetPrinter:null, queue:[], serverIPs:[], preferredIP:null };
+  var state = { paused:false, printers:[], targetPrinter:null, queue:[], serverIPs:[], preferredIP:null, stripLang:false };
 
   function $(id){ return document.getElementById(id); }
   function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
@@ -104,6 +127,20 @@
     return '<span class="pill ' + m.c + '">' + txt + '</span>';
   }
   function timeOf(t){ return t? new Date(t).toLocaleTimeString() : '—'; }
+
+  // 作业语言前导标记：提示这条任务可能对应纸面乱码
+  function langFlagsOf(j){
+    var keys = ['uel','pjl','ejl'];
+    return keys.filter(function(k){ return j.lang && j.lang[k]; });
+  }
+  function langBadge(j){
+    var f = langFlagsOf(j);
+    if(!f.length) return '';
+    var tip = '检测到作业语言前导：' + f.join(' + ').toUpperCase() +
+      '\n这可能是纸面乱码（如 284.4@EJL / @PJL）的来源。' +
+      (j.stripped ? '\n已在转发前自动剥离 ' + j.stripped + ' 字节前导。' : '\n可在上方开启"剥离作业语言前导"由主机自动处理。');
+    return ' <span class="badsmall" title="' + esc(tip) + '">' + (j.stripped ? '已剥离' : '协商') + '</span>';
+  }
 
   async function api(path, body){
     try {
@@ -137,6 +174,10 @@
     var run = state.queue.filter(function(j){ return j.status==='queued'||j.status==='printing'; }).length;
     $('queueCount').textContent = run + ' 个待处理 / ' + state.queue.length + ' 总';
     $('pauseBtn').textContent = state.paused ? '▶ 继续队列' : '⏸ 全局暂停';
+    // 协商前导统计与开关
+    var langN = state.queue.filter(function(j){ return langFlagsOf(j).length; }).length;
+    $('langCount').textContent = langN ? langN + ' 条任务检测到协商前导' : '';
+    $('stripBtn').textContent = '剥离作业语言前导：' + (state.stripLang ? '开' : '关');
     // 表格
     var tb = $('queueBody');
     if(!state.queue.length){ tb.innerHTML = '<tr><td colspan="7" class="noc">暂无任务</td></tr>'; return; }
@@ -156,7 +197,7 @@
         '<td><span title="'+esc(j.from)+'">'+esc(fmtSrc(j.from))+'</span></td>' +
         '<td>'+esc(j.printer||'—')+' <span class="hint">('+fmtBytes(j.bytes)+')</span></td>' +
         '<td class="pri">'+j.priority+'</td>' +
-        '<td>'+statusPill(j)+'</td>' +
+        '<td>'+statusPill(j)+langBadge(j)+'</td>' +
         '<td class="ops">'+ops+'</td>' +
         '</tr>';
     }).join('');
@@ -181,6 +222,7 @@
   $('applyBtn').addEventListener('click', function(){ api('/api/printer',{name:$('printerSelect').value}); });
   $('pauseBtn').addEventListener('click', function(){ api('/api/pause',{paused:!state.paused}); });
   $('clearBtn').addEventListener('click', function(){ api('/api/clear-done'); });
+  $('stripBtn').addEventListener('click', function(){ api('/api/strip-lang',{stripLang:!state.stripLang}); });
 
   function downloadBlob(blob, name){
     var a = document.createElement('a');
@@ -200,7 +242,7 @@
       } else {
         var blob = await resp.blob();
         downloadBlob(blob, '打印客户端安装包_'+host+'.zip');
-        alert('已下载 zip 安装包（内含单个安装脚本 安装共享打印机.bat，指向 '+host+'，驱动 '+driver+'）。\n请把 zip 复制到局域网内其它电脑，解压后直接双击 .bat 运行即可（跨 Win7-11，无需其它文件）。\n可先用记事本打开 .bat 核对 IP/驱动。');
+        alert('已下载 zip 安装包（内含单个安装脚本 安装共享打印机.bat，指向 '+host+'，共享打印机 '+driver+'，脚本内自动取驱动型号名）。\n请把 zip 复制到局域网内其它电脑，解压后直接双击 .bat 运行即可（跨 Win7-11，无需其它文件）。\n可先用记事本打开 .bat 核对 IP/驱动。');
       }
     } catch(e){ alert('生成失败：无法连接服务器'); }
     $('genBtn').disabled = false; $('genBtn').textContent = '⬇ 下载 zip 安装包';
@@ -210,6 +252,7 @@
     try {
       var st = await (await fetch('/api/status')).json();
       state.paused = st.paused; state.printers = st.printers||[];
+      state.stripLang = !!st.stripLang;
       state.targetPrinter = st.targetPrinter; state.defaultPrinter = st.defaultPrinter;
       state.queue = st.queue||[];
       state.serverIPs = st.serverIPs||[];

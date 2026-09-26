@@ -29,12 +29,11 @@
       "tray-icon.png",
       "icon.png",
       "icon.ico",
-      "config.json",
-      "queue"
+      "config.json"
     ],
     "win": {
       "target": [
-        { "target": "portable", "arch": ["x64", "ia32"] }
+        { "target": "portable", "arch": ["x64"] }
       ],
       "icon": "icon.ico",
       "requestedExecutionLevel": "asInvoker",

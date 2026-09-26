@@ -21,18 +21,34 @@ const DRYRUN = process.env.DRYRUN === '1'; // 测试用：只走队列流程，�
 const PS = 'powershell';
 const PS_OPTS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass'];
 const WINSPOOL = path.join(__dirname, 'winspool.ps1');
-const QUEUE_DIR = path.join(__dirname, 'queue');
+
+// PowerShell 在没有控制台时（打包版 GUI 正常运行即如此）用 OEM 代码页写 stdout，
+// Node 按 UTF-8 读取，中文打印机名会变成 U+FFFD 乱码（"M227fdw 财务" -> "M227fdw ���"）。
+// 乱码名会连带毁掉打印目标与驱动型号查询，所以每条要读文本的 -Command 都先强制 UTF-8 输出。
+const PS_UTF8 = 'try{[Console]::OutputEncoding=[Text.Encoding]::UTF8}catch{}; ';
+function psCmd(cmd) { return PS_UTF8 + cmd; }
+
+// 便携版 exe 每次启动都会解压到临时目录，__dirname 随之变化，
+// 队列与配置若写在 __dirname 下会每次重启就丢。因此打包运行时改放 %APPDATA%\PrintShare；
+// 源码方式运行（npm start / npm run electron / 测试）仍用项目目录，行为不变。
+const PACKAGED = !!(process.env.PORTABLE_EXECUTABLE_DIR || process.env.PORTABLE_EXECUTABLE_FILE);
+const DATA_ROOT = PACKAGED
+  ? path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'PrintShare')
+  : __dirname;
+
+const QUEUE_DIR = path.join(DATA_ROOT, 'queue');
 const META_FILE = path.join(QUEUE_DIR, 'meta.json');
 
 const CONFIG = {
   rawPort: Number(process.env.RAW_PORT) || 9100,
   adminPort: Number(process.env.ADMIN_PORT) || 8081,
-  configFile: path.join(__dirname, 'config.json'),
+  configFile: path.join(DATA_ROOT, 'config.json'),
 };
 
 // ---------- 状态 ----------
 let targetPrinter = null;
 let globalPaused = false;
+let stripLang = false; // 是否在转发前剥离作业语言前导（PJL/EJL/UEL），默认关闭
 let jobs = []; // 任务数组（内存中的元数据，数据本体在磁盘）
 let seq = 0;
 let pumping = false;
@@ -72,6 +88,7 @@ function loadState() {
   try {
     const c = JSON.parse(fs.readFileSync(CONFIG.configFile, 'utf8'));
     targetPrinter = c.printer || null;
+    stripLang = !!c.stripLang;
   } catch (_) { /* 首次运行 */ }
   try {
     const m = JSON.parse(fs.readFileSync(META_FILE, 'utf8'));
@@ -89,15 +106,21 @@ function persist() {
   } catch (e) { console.error('保存队列元数据失败:', e.message); }
 }
 
+function persistConfig() {
+  try {
+    fs.writeFileSync(CONFIG.configFile, JSON.stringify({ printer: targetPrinter, stripLang }, null, 2));
+  } catch (e) { console.error('保存配置失败:', e.message); }
+}
+
 async function listPrinters() {
   try {
-    const { stdout } = await execFileP(PS, PS_OPTS.concat(['-Command', 'Get-Printer | ForEach-Object { $_.Name }']), { maxBuffer: 1e6 });
+    const { stdout } = await execFileP(PS, PS_OPTS.concat(['-Command', psCmd('Get-Printer | ForEach-Object { $_.Name }')]), { maxBuffer: 1e6 });
     return stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
   } catch (_) { return []; }
 }
 async function defaultPrinter() {
   try {
-    const { stdout } = await execFileP(PS, PS_OPTS.concat(['-Command', '(Get-CimInstance Win32_Printer -Filter "Default=$true").Name']), { maxBuffer: 1e6 });
+    const { stdout } = await execFileP(PS, PS_OPTS.concat(['-Command', psCmd('(Get-CimInstance Win32_Printer -Filter "Default=$true").Name')]), { maxBuffer: 1e6 });
     return stdout.trim() || null;
   } catch (_) { return null; }
 }
@@ -123,6 +146,41 @@ async function cachedDefaultPrinter() {
   return defCache;
 }
 
+// 队列名 -> 驱动型号名（Win32_Printer.DriverName）。
+// 客户端脚本里 `prnmngr.vbs -m` 需要的是"驱动型号名"，不是队列名：
+//   队列名可以随意改成中文（"M227fdw 财务"），驱动型号名是安装驱动时写死的，
+//   实际都是 ASCII（"HP LaserJet MFP M227-M231 PCL-6"）。
+// 传队列名会导致 -m 匹配不到驱动而安装失败；中文队列名还会让 .bat 变成非 ASCII，
+// 在 Win7 cmd 下解析错乱甚至闪退。用队列名作参数，靠 env 传递避免引号/编码问题。
+const drvModelCache = new Map();
+async function printerDriverModel(queueName) {
+  if (!queueName) return null;
+  if (drvModelCache.has(queueName)) return drvModelCache.get(queueName);
+  let model = null;
+  try {
+    const { stdout } = await execFileP(
+      PS,
+      PS_OPTS.concat(['-Command', psCmd('(Get-CimInstance Win32_Printer | Where-Object { $_.Name -eq $env:_Q } | Select-Object -First 1).DriverName')]),
+      { maxBuffer: 1e6, env: Object.assign({}, process.env, { _Q: queueName }) }
+    );
+    model = stdout.trim() || null;
+  } catch (_) { model = null; }
+  if (model) drvModelCache.set(queueName, model);
+  return model;
+}
+
+// 生成的 .bat 必须纯 ASCII：非 ASCII 字节在 Win7 的 cmd 下会解析错乱甚至闪退
+//（UTF-8 中文批处理 + chcp 65001 是已知的崩溃组合）。这里把所有注入值收敛到
+// 可打印 ASCII，并去掉会破坏 `set "X=..."` 的引号与 %（% 会被当变量展开），
+// 保证任何 Windows 任何代码页下解析一致。
+function asciiOnly(s) {
+  return String(s == null ? '' : s)
+    .replace(/[^\x20-\x7E]/g, '')
+    .replace(/["%]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // ---------- 任务队列 ----------
 function nextJob() {
   return jobs
@@ -145,7 +203,25 @@ async function runWinspool(job) {
   }
 }
 
+// 转发前剥离作业语言前导（仅在管理页开启该开关时执行）
+function applyStrip(job) {
+  try {
+    const buf = fs.readFileSync(job.file);
+    const r = stripJobLanguage(buf);
+    if (!r) return;
+    const tmp = `${job.file}.tmp`;
+    fs.writeFileSync(tmp, r.buf);
+    fs.renameSync(tmp, job.file);
+    job.bytes = r.buf.length;
+    job.stripped = r.removed;
+    console.log(`[协商] 任务#${job.seq} 已剥离 ${r.removed} 字节作业语言前导（${buf.length} -> ${r.buf.length} 字节）`);
+  } catch (e) {
+    console.error(`[协商] 任务#${job.seq} 剥离失败，按原样投递：`, e.message);
+  }
+}
+
 async function deliver(job) {
+  if (stripLang && langFlags(job.lang).length) applyStrip(job);
   if (DRYRUN) { await sleep(1200); return { ok: true, err: '' }; }       // 测试：模拟投递耗时
   return runWinspool(job);
 }
@@ -189,10 +265,12 @@ function enqueue(socket) {
   const w = fs.createWriteStream(ingest);
   let received = 0;
   let closed = false;
+  let head = Buffer.alloc(0); // 只保留开头一小段，用于识别作业语言前导
 
   socket.on('data', (c) => {
     if (closed) return;
     received += c.length;
+    if (head.length < HEAD_SCAN) head = Buffer.concat([head, c.slice(0, HEAD_SCAN - head.length)]);
     w.write(c); // 流式写盘，不占用内存缓冲
   });
   socket.on('error', (e) => { console.error('TCP 错误:', e.message); closed = true; w.destroy(); fs.unlink(ingest, () => {}); });
@@ -202,14 +280,23 @@ function enqueue(socket) {
     w.end(() => {
       if (received === 0) { fs.unlink(ingest, () => {}); return; }
       try { fs.renameSync(ingest, finalFile); } catch (e) { console.error('改文件名失败:', e.message); return; }
+      const lang = scanJobLanguage(head);
       const job = {
         id, seq: ++seq, from: fromAddr,
         printer: targetPrinter || null, bytes: received,
         status: 'queued', priority: 0, paused: false,
         createdAt: Date.now(), startedAt: null, finishedAt: null, error: null, file: finalFile,
+        lang, stripped: 0,
       };
       jobs.push(job); persist();
       console.log(`[入队] 任务#${job.seq} 来自 ${job.from}（${received} 字节）`);
+      const flags = langFlags(lang);
+      if (flags.length) {
+        console.warn(`[协商] 任务#${job.seq} 检测到作业语言前导：${flags.join(' + ').toUpperCase()}` +
+          `（目标打印机 ${job.printer || '未设置'}，品牌 ${brandOf(job.printer)}）`);
+        console.warn(`[协商] 纸面若出现乱码，请在客户端驱动侧关闭对应开关；` +
+          `或在管理页开启"剥离作业语言前导"由主机自动剥离。`);
+      }
       pump();
     });
   });
@@ -254,7 +341,7 @@ async function preferredHostIP() {
   let best = null;
   try {
     const cmd = `$r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1; if ($r) { (Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $r.ifIndex -ErrorAction SilentlyContinue | Where-Object { $_.Address -notlike '169.254*' } | Select-Object -First 1).IPAddress }`;
-    const { stdout } = await execFileP(PS, PS_OPTS.concat(['-Command', cmd]), { maxBuffer: 1e6 });
+    const { stdout } = await execFileP(PS, PS_OPTS.concat(['-Command', psCmd(cmd)]), { maxBuffer: 1e6 });
     best = (stdout.match(/\d+\.\d+\.\d+\.\d+/) || [])[0] || null;
   } catch (_) { best = null; }
   if (!best || best === '0.0.0.0') best = serverIPs()[0] || null;
@@ -262,16 +349,144 @@ async function preferredHostIP() {
   return best;
 }
 
+// ---------- 驱动 ↔ 打印机协商：作业语言前导 ----------
+// 现象：驱动经 TCP/IP 端口打印时，会在作业开头插入一段"作业语言"同步/协商命令。
+//   打印机不支持（或该模式被关）时，这段命令不会被识别，而是被当正文原样打印出来，
+//   纸面出现乱码、正文被下移、版式与本地打印不一致。
+//   - 爱普生 LQ 针式：EJL（`@EJL` / `ESC 01 @EJL 1284.4`），纸面表现为 "284.4@EJL"。
+//     官方解法是驱动"打包模式(Packet mode)"设为关（爱普生 FAQ 310058）。
+//   - HP：PJL 包在 UEL（ESC%-12345X）之间；HP PJL 手册说明，非 PJL 打印机会把这些
+//     命令在 PCL 复位(ESC E)之前按 ASCII 文本打印出来，即纸面出现 `@PJL`。
+//   - 佳能：官方把"打印乱码"归因为驱动选错型号；CAPT 为宿主型驱动，依赖佳能专有
+//     数据流，跨 TCP/IP 转发时应优先改用 PCL/PS 或 UFR II 驱动。
+const UEL = Buffer.from([0x1b, 0x25, 0x2d, 0x31, 0x32, 0x33, 0x34, 0x35, 0x58]); // ESC % - 1 2 3 4 5 X
+const HEAD_SCAN = 4096; // 只扫作业开头这么多字节
+
+function brandOf(name) {
+  const s = String(name || '').toLowerCase();
+  if (s.includes('epson') || s.includes('爱普生')) return 'epson';
+  if (s.includes('hewlett') || s.includes('惠普') || /\bhp\b/.test(s) || s.includes('laserjet') || s.includes('deskjet')) return 'hp';
+  if (s.includes('canon') || s.includes('佳能')) return 'canon';
+  return 'generic';
+}
+
+const BRAND_TIPS = {
+  epson: [
+    'Symptom: garbage text at the top of the page (e.g. "284.4@EJL") and the body',
+    'is pushed down, so the layout differs from printing locally.',
+    'Cause: the driver sends an EJL "Packet mode" sync command first; a printer',
+    'that does not support it (or has Packet mode off) prints it as plain text.',
+    'Fix: on the CLIENT PC open this printer\'s "Printer properties" ->',
+    '"Device settings" -> set "Packet mode" to "Off". If the driver has no such',
+    'option, set the printer\'s own default "Packet mode" to "Auto".',
+    'Reference: Epson FAQ 310058.',
+  ],
+  hp: [
+    'Symptom: control text such as "@PJL" printed on paper.',
+    'Cause: the driver wraps the job in PJL between UEL (ESC%-12345X) markers;',
+    'a printer without PJL support prints those commands as ASCII text.',
+    'Fix: use the driver that matches this exact model, set the printer',
+    'language / "Personality" to "Auto", and prefer a PCL5/PCL6 or PostScript',
+    'driver (HP universal drivers do not support host-based devices).',
+    'Reference: HP PJL Technical Reference Manual.',
+  ],
+  canon: [
+    'Symptom: garbled text or a wrong layout.',
+    'Canon attributes garbled output to the wrong driver being selected: make',
+    'sure the driver installed matches this exact model. CAPT drivers are',
+    'host-based and rely on a Canon proprietary data stream, so for printing',
+    'through a raw TCP/IP port prefer a PCL/PS or UFR II driver.',
+  ],
+  generic: [
+    'Symptom: control text such as "284.4@EJL" (Epson) or "@PJL" (HP) printed',
+    'on paper, with the body pushed down.',
+    'Cause: the client driver is sending a job-language handshake that the',
+    'printer does not understand, so it is printed as plain text.',
+    'Fix: Epson -> "Device settings" -> "Packet mode" = Off;',
+    '     HP     -> printer language / "Personality" = "Auto", use PCL/PS driver;',
+    '     Canon  -> install the driver matching this exact model.',
+  ],
+};
+
+function tipBlock(driver) {
+  const brand = brandOf(driver);
+  const label = brand === 'generic' ? 'general' : brand.toUpperCase();
+  return [`--- Driver/printer negotiation tips (${label}) ---`]
+    .concat(BRAND_TIPS[brand])
+    .concat([
+      'Common to all brands: on the CLIENT PC, "Printer properties" -> "Ports" ->',
+      'clear "Enable bidirectional support" - this relay is one-way, so status',
+      'queries can only make printing stall.',
+    ])
+    .map((l) => `REM  ${l}`)
+    .join('\n');
+}
+
+// 扫描作业开头，判断是否含作业语言前导（返回命中的标志位）
+function scanJobLanguage(head) {
+  if (!head || !head.length) return { uel: false, pjl: false, ejl: false };
+  const txt = head.toString('latin1');
+  return {
+    uel: head.indexOf(UEL) >= 0,
+    pjl: txt.includes('@PJL'),
+    ejl: txt.includes('@EJL'),
+  };
+}
+
+function langFlags(lang) {
+  return ['uel', 'pjl', 'ejl'].filter((k) => lang && lang[k]);
+}
+
+// 只剥离作业开头的 UEL / @PJL / @EJL 前导块与结尾 UEL，不动正文；返回剥离掉的字节数
+function stripJobLanguage(buf) {
+  let i = 0;
+  for (;;) {
+    if (buf.length - i >= UEL.length && buf.compare(UEL, 0, UEL.length, i, i + UEL.length) === 0) {
+      i += UEL.length; continue;
+    }
+    // 爱普生打包模式前缀 ESC 01，仅在紧跟 @EJL 时剥离
+    if (buf[i] === 0x1b && buf[i + 1] === 0x01 && buf.toString('latin1', i + 2, i + 6) === '@EJL') {
+      i += 2; continue;
+    }
+    let j = i;
+    while (j < buf.length && (buf[j] === 0x20 || buf[j] === 0x09 || buf[j] === 0x0d || buf[j] === 0x0a)) j++;
+    const tag = buf.toString('latin1', j, j + 4);
+    if (tag === '@PJL' || tag === '@EJL') {
+      while (j < buf.length && buf[j] !== 0x0a && buf[j] !== 0x0d) j++;
+      while (j < buf.length && (buf[j] === 0x0a || buf[j] === 0x0d)) j++;
+      i = j; continue;
+    }
+    break;
+  }
+  let end = buf.length;
+  if (end - i >= UEL.length && buf.compare(UEL, 0, UEL.length, end - UEL.length, end) === 0) end -= UEL.length;
+  if (i === 0 && end === buf.length) return null;
+  return { buf: buf.slice(i, end), removed: buf.length - (end - i) };
+}
+
 // 生成客户端一键安装脚本：安装共享打印机.bat —— 纯 Batch 单文件、可读可审计
 //   （先只读校验、后最小提权修改、失败不破坏原配置），跨 Win7/8/10/11。
+// 编码：整个 bat 只用 ASCII（英文提示），不用 chcp/UTF-8 —— UTF-8 中文批处理在
+//   Win7 的 chcp 65001 下会解析错乱闪退，部分 Win10 配置也会丢失中文，纯 ASCII
+//   在任何 Windows 上解析一致。
 // 安全设计：不用 Base64 隐藏、不自带可执行 ps1（删除 client-install.ps1 相关注释）、
 //   用系统内置 prnport.vbs/prnmngr.vbs（cscript）避免 Win8+ 才有的 Get-Printer 依赖、
 //   UAC 提权只在真正需要创建/删除打印机时触发、删除前先确认且只动本脚本命名的对象、
 //   创建端口前先用 TCP 探测验证目标服务器可达。
 function buildClientScript(host, portNum, driver) {
-  const printerName = `共享打印机 (${host})`;
-
-  const portName = `IP_${host}`;
+  // 注入到 .bat 的值全部收敛为 ASCII，避免非 ASCII 批处理在 Win7 cmd 下闪退
+  const safeHost = asciiOnly(host);
+  const safeDriver = asciiOnly(driver);
+  const safePort = String(Number(portNum) || 9100);
+  const portName = `IP_${safeHost}`;
+  // 原始驱动名被裁剪过（含中文等）时，留一行 REM 提示，便于客户机核对/手改
+  const drvNote = safeDriver !== String(driver == null ? '' : driver).trim()
+    ? ['REM  NOTE: the driver name above was reduced to ASCII. If the [2/4] driver check',
+       'REM  fails, edit _DRV to the exact driver model name shown on the client PC by:',
+       'REM    wmic printer get name,drivername',
+       'REM  (queue names may be localized, but the driver model name is ASCII).',
+       ''].join('\r\n')
+    : '';
 
   // 纯 Batch 单文件安装脚本，跨 Windows 7/8/8.1/10/11（32/64 位）。
   // 用系统内置的打印管理脚本（prnport.vbs 管端口、prnmngr.vbs 管打印机），经 cscript 运行，
@@ -281,25 +496,29 @@ function buildClientScript(host, portNum, driver) {
   //   删除前先询问且只删本脚本命名的对象、创建端口前先验证服务器 TCP 可达。
   const bat = String.raw`@echo off
 setlocal EnableExtensions
-chcp 65001 >nul
-title 网络打印机安装程序（安全模式）
+title Network Printer Installer (Safe Mode)
 REM ============================================================
-REM  网络打印机一键安装 · 单文件 · 适用 Windows 7/8/10/11(32/64位)
-REM  用系统内置打印脚本：prnport.vbs(端口) + prnmngr.vbs(打印机)，
-REM  经 cscript 运行，不依赖 Win8+ 才有的 Get-Printer/Add-Printer。
-REM  先做只读检查(验证服务器、检查驱动、检查同名对象)，仅在确需
-REM  修改打印机时才请求管理员权限；只动"本脚本创建的对象"。
-REM  本文件可先用记事本打开，核对下方"配置"的服务器IP/驱动，确认无误再运行。
+REM  Network printer one-click installer - single file - Windows 7/8/10/11 (32/64 bit)
+REM  Uses built-in Windows print scripts: prnport.vbs (port) + prnmngr.vbs (printer),
+REM  run via cscript - no dependency on Win8+ only Get-Printer/Add-Printer cmdlets.
+REM  Read-only checks first (server reachable, driver present, same-name objects);
+REM  admin rights requested ONLY when actually creating/deleting the printer;
+REM  only touches objects created by this script.
+REM  This file is pure ASCII text - open it in Notepad to review the
+REM  server IP / driver below before running. (ASCII: no chcp/codepage issues
+REM  on any Windows, unlike UTF-8 batch files that break on Win7 cmd.)
+REM
+${tipBlock(safeDriver)}
 REM ============================================================
 
-REM ===== 配置（打印服务器自动生成，可核对/修改）=====
-set "_HOST=${host}"
-set "_PORT=${portNum}"
-set "_DRV=${driver}"
+REM ===== Configuration (generated by print server - verify/edit below) =====
+set "_HOST=${safeHost}"
+set "_PORT=${safePort}"
+set "_DRV=${safeDriver}"
 set "_PORTN=${portName}"
-set "_PNAME=${printerName}"
-set "_DRVF=${driver},"
-
+set "_PNAME=SharedPrinter (%_HOST%)"
+set "_DRVF=${safeDriver},"
+${drvNote}
 set "_PP=%WinDir%\System32\Printing_Admin_Scripts\zh-CN\prnport.vbs"
 if not exist "%_PP%" set "_PP=%WinDir%\System32\Printing_Admin_Scripts\en-US\prnport.vbs"
 set "_PN=%WinDir%\System32\Printing_Admin_Scripts\zh-CN\prnmngr.vbs"
@@ -307,51 +526,52 @@ if not exist "%_PN%" set "_PN=%WinDir%\System32\Printing_Admin_Scripts\en-US\prn
 if not exist "%_PP%" goto :noAdminScript
 if not exist "%_PN%" goto :noAdminScript
 
-REM ===== 若是提权后的第二趟（带参数 elev），直接进入修改 =====
+REM ===== Second run after UAC elevation (arg: elev) goes straight to modification =====
 if /i "%~1"=="elev" goto :modify
 
 echo.
 echo   ////////////////////////////////////////////
-echo   //  网络打印机安装程序（安全模式）          //
+echo   //  Network Printer Installer (Safe Mode) //
 echo   ////////////////////////////////////////////
-echo   目标服务器 : %_HOST%
-echo   打印端口   : %_PORT%
-echo   使用驱动   : %_DRV%
-echo   将新建     : %_PNAME%  ^(端口 %_PORTN%^)
+echo   Server       : %_HOST%
+echo   Port         : %_PORT%
+echo   Driver       : "%_DRV%"
+echo   Will create  : %_PNAME%  ^(port %_PORTN%^)
 echo.
 
-REM ---- [1/4] 验证服务器 TCP 可达（只读，无需管理员）----
-echo   [1/4] 验证服务器 %_HOST%:%_PORT% 是否可达 ...
+REM ---- [1/4] Verify server TCP reachable (read-only, no admin needed) ----
+echo   [1/4] Checking server %_HOST%:%_PORT% ...
 set "_CK=%TEMP%\pschk_rch"
 powershell -NoProfile -Command "$c=New-Object Net.Sockets.TcpClient; try{$c.Connect($env:_HOST,[int]$env:_PORT);$x=1}catch{$x=0};$c.Close(); if($x){[IO.File]::WriteAllText($env:_CK,'1')}else{[IO.File]::WriteAllText($env:_CK,'0')}"
 set "_RCH=0"
 set /p _RCH= < "%_CK%"
 if "%_RCH%"=="1" goto :reach_ok
-echo   无法连接 %_HOST%:%_PORT%。
-echo   请检查：IP 是否正确；打印服务器主机是否开机且服务已运行；防火墙是否放行 TCP %_PORT%。
-set /p "YN=   仍要继续安装吗？ y/N "
+echo   Cannot reach %_HOST%:%_PORT%.
+echo   Check: is the IP correct? Is the print-server PC on and the service running?
+echo   Is the firewall allowing inbound TCP %_PORT%?
+set /p "YN=   Continue anyway? y/N "
 if /i not "%YN%"=="y" goto :cancel
 :reach_ok
-echo   OK，服务器在线。
+echo   OK, server is online.
 
-REM ---- [2/4] 检查驱动（只读）----
+REM ---- [2/4] Check driver (read-only) ----
 echo.
-echo   [2/4] 检查打印机驱动 %_DRV% ...
+echo   [2/4] Checking printer driver "%_DRV%" ...
 set "_CK=%TEMP%\pschk_drv"
 powershell -NoProfile -Command "if(@(Get-WmiObject Win32_PrinterDriver | Where-Object { $_.Name.StartsWith($env:_DRVF) }).Count -gt 0){[IO.File]::WriteAllText($env:_CK,'1')}else{[IO.File]::WriteAllText($env:_CK,'0')}"
 set "_HD=0"
 set /p _HD= < "%_CK%"
 if "%_HD%"=="1" goto :drv_ok
-echo   未安装该驱动：%_DRV%
-echo   这台电脑上已安装的驱动：
+echo   Driver not installed: "%_DRV%"
+echo   Drivers installed on this PC:
 powershell -NoProfile -Command "Get-WmiObject Win32_PrinterDriver | ForEach-Object { Write-Host ('      - ' + $_.Name) }"
-echo   请先安装与该型号匹配的厂商官方驱动，再重跑本脚本。
+echo   Install the matching vendor driver for this model, then run this script again.
 pause
 exit /b 4
 :drv_ok
-echo   驱动已就绪。
+echo   Driver is ready.
 
-REM ---- [3/4] 检查是否有本脚本之前创建的同名对象（只读）----
+REM ---- [3/4] Check for same-name objects created before (read-only) ----
 echo.
 set "_CK=%TEMP%\pschk_prt"
 set "_PE=0"
@@ -365,34 +585,34 @@ set "_HIT=0"
 if "%_PE%"=="1" set "_HIT=1"
 if "%_PR%"=="1" set "_HIT=1"
 if not "%_HIT%"=="1" goto :fresh
-echo   [3/4] 检测到之前用本脚本安装过的对象：
-if "%_PR%"=="1" echo          - 打印机 %_PNAME%
-if "%_PE%"=="1" echo          - 端口   %_PORTN%
-set /p "YN=         将删除并重建它们。不影响其它打印机/端口，继续？ y/N "
+echo   [3/4] Found objects installed by this script before:
+if "%_PR%"=="1" echo          - printer %_PNAME%
+if "%_PE%"=="1" echo          - port   %_PORTN%
+set /p "YN=         Delete and recreate them? Other printers/ports are untouched. Continue? y/N "
 if /i not "%YN%"=="y" goto :cancelKeep
-echo         确认覆盖。
+echo         Confirmed overwrite.
 goto :chkdone
 :fresh
-echo   [3/4] 未发现同名旧对象，按全新安装处理。
+echo   [3/4] No same-name old objects found; treating as fresh install.
 :chkdone
 
-REM ---- [4/4] 仅在需要修改打印机时才要求管理员权限 ----
+REM ---- [4/4] Request admin rights only when the printer must be modified ----
 echo.
 net session >nul 2>&1
 if "%errorlevel%"=="0" goto :haveAdmin
-echo   创建/删除端口或打印机需要管理员权限，即将请求授权 ...
+echo   Creating/deleting ports or printers requires administrator rights. Requesting now ...
 powershell -NoProfile -Command "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', '""%~f0"" elev' -Verb RunAs"
-echo   已请求提权重跑（本窗口可关闭）。
+echo   Elevation requested - this window can be closed.
 pause
 exit /b 0
 :haveAdmin
-echo   已具备管理员权限，开始配置 ...
+echo   Running with administrator rights; configuring ...
 goto :modify
 
 :modify
 echo.
-echo   [已提权] 开始创建/更新打印机（只读检查已在普通权限下完成）...
-REM 提权后为一次全新 cmd 会话，重新确认同名对象是否存在
+echo   [elevated] Creating/updating the printer (read-only checks already done) ...
+REM after elevation this is a fresh cmd session - re-check same-name objects
 set "_CK=%TEMP%\pschk_prt"
 set "_PE=0"
 powershell -NoProfile -Command "if(@(Get-WmiObject Win32_TCPIPPrinterPort | Where-Object { $_.Name -eq $env:_PORTN }).Count -gt 0){[IO.File]::WriteAllText($env:_CK,'1')}else{[IO.File]::WriteAllText($env:_CK,'0')}"
@@ -404,47 +624,48 @@ set /p _PR= < "%_CK%"
 if "%_PR%"=="1" goto :delPrn
 goto :delPrnNext
 :delPrn
-echo   删除旧打印机 %_PNAME% ...
+echo   Deleting old printer %_PNAME% ...
 cscript //Nologo "%_PN%" -d -p "%_PNAME%"
 :delPrnNext
 if "%_PE%"=="1" goto :delPrnPort
 goto :createPort
 :delPrnPort
-echo   删除旧端口 %_PORTN% ...
+echo   Deleting old port %_PORTN% ...
 cscript //Nologo "%_PP%" -d -r "%_PORTN%"
 :createPort
-echo   正在创建打印端口 %_PORTN% (%_HOST%:%_PORT%) ...
+echo   Creating printer port %_PORTN% (%_HOST%:%_PORT%) ...
 cscript //Nologo "%_PP%" -a -r "%_PORTN%" -h "%_HOST%" -o raw -n %_PORT%
 if errorlevel 1 goto :modifyFail
 
-echo   正在建立打印机 %_PNAME% ...
+echo   Creating printer %_PNAME% ...
 cscript //Nologo "%_PN%" -a -p "%_PNAME%" -r "%_PORTN%" -m "%_DRV%"
 if errorlevel 1 goto :modifyFail
 
 echo.
-echo   配置完成！已创建打印机：%_PNAME%
+echo   Done! Printer created: %_PNAME%
 echo.
-echo   本脚本不修改默认打印机，如需设为默认请自己操作：
-echo     方式1：设置 - 蓝牙和其他设备 - 打印机和扫描仪 - 选中"%_PNAME%" - 点击"设为默认值"；
-echo     方式2：控制面板 - 设备和打印机 - 右键"%_PNAME%" - 设为默认打印机。
+echo   This script does NOT change the default printer. To set it as default:
+echo     Settings - Bluetooth ^& devices - Printers ^& scanners - select "%_PNAME%" - "Set as default";
+echo     or Control Panel - Devices and Printers - right-click "%_PNAME%" - Set as default printer.
 pause
 exit /b 0
 
 :cancel
-echo   已取消，保留原配置不变。
+echo   Cancelled - original configuration kept unchanged.
 pause
 exit /b 3
 :cancelKeep
-echo   已取消，保留现有配置。
+echo   Cancelled - existing configuration kept.
 pause
 exit /b 5
 :noAdminScript
-echo   [错误] 找不到系统打印管理脚本（Printing_Admin_Scripts\prnport.vbs 等）。
-echo   请确认这是完整的 Windows 系统目录。按回车退出。
+echo   [ERROR] Windows print admin scripts not found (Printing_Admin_Scripts\prnport.vbs etc).
+echo   Please make sure this is a full Windows system directory. Press Enter to exit.
 pause
 exit /b 1
 :modifyFail
-echo   [失败] 打印机配置未成功，请查看上方报错后重试；原配置已尽量保留。
+echo   [FAILED] Printer configuration was not applied. See errors above and retry;
+echo   original configuration was preserved as much as possible.
 pause
 exit /b 1`.replace(/\n/g, '\r\n');
 
@@ -532,7 +753,7 @@ const adminServer = http.createServer(async (req, res) => {
     if (!def && printers.length) def = printers[0];
     const queue = [...jobs].sort((a, b) => (a.createdAt - b.createdAt));
     const preferredIP = await preferredHostIP();
-    return sendJson(res, { rawPort: CONFIG.rawPort, adminPort: CONFIG.adminPort, targetPrinter, defaultPrinter: def, printers, paused: globalPaused, serverIPs: serverIPs(), preferredIP, queue });
+    return sendJson(res, { rawPort: CONFIG.rawPort, adminPort: CONFIG.adminPort, targetPrinter, defaultPrinter: def, printers, paused: globalPaused, stripLang, serverIPs: serverIPs(), preferredIP, queue });
   }
 
   if (url === '/api/printer' && method === 'POST') {
@@ -542,7 +763,7 @@ const adminServer = http.createServer(async (req, res) => {
         const { name } = JSON.parse(body);
         if (name) { const printers = await listPrinters(); targetPrinter = printers.includes(name) ? name : targetPrinter; }
         else targetPrinter = null;
-        fs.writeFileSync(CONFIG.configFile, JSON.stringify({ printer: targetPrinter }, null, 2));
+        persistConfig();
         printerCache = null; defCacheAt = 0; // 让下次 /api/status 重新枚举
         // 已入队未指定打印机的任务沿用新选择
         jobs.forEach((j) => { if (!j.printer && j.status === 'queued') j.printer = targetPrinter; });
@@ -558,6 +779,15 @@ const adminServer = http.createServer(async (req, res) => {
       try { globalPaused = !!JSON.parse(body).paused; persist(); } catch (_) {}
       pump();
       sendJson(res, { paused: globalPaused });
+    });
+  }
+
+  if (url === '/api/strip-lang' && method === 'POST') {
+    let body = ''; req.on('data', (c) => (body += c));
+    return req.on('end', () => {
+      try { stripLang = !!JSON.parse(body).stripLang; } catch (_) {}
+      persistConfig();
+      sendJson(res, { stripLang });
     });
   }
 
@@ -592,9 +822,12 @@ const adminServer = http.createServer(async (req, res) => {
   if ((url === '/api/client-script' || url === '/api/client-package') && method === 'GET') {
     const q = new URL(req.url, 'http://x').searchParams;
     let host = q.get('host') || '';
-    const driver = q.get('driver') || targetPrinter || (await cachedDefaultPrinter());
+    const queue = q.get('driver') || targetPrinter || (await cachedDefaultPrinter());
     if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(host)) host = (await preferredHostIP()) || '';
-    if (!driver) return sendJson(res, { ok: false, reason: '尚未选择要共享的打印机，请先在上方选择并保存' }, 400);
+    if (!queue) return sendJson(res, { ok: false, reason: '尚未选择要共享的打印机，请先在上方选择并保存' }, 400);
+    // 客户端脚本的 -m 要的是"驱动型号名"而不是队列名（队列名可能是中文，会导致脚本非 ASCII
+    // 而在 Win7 闪退，且 -m 匹配不到驱动）。优先用队列名反查 DriverName，查不到才退回队列名。
+    const driver = (await printerDriverModel(queue)) || queue;
     if (!host) return sendJson(res, { ok: false, reason: '无法确定服务器 IP' }, 400);
     const { bat, batName } = buildClientScript(host, CONFIG.rawPort, driver);
     if (url === '/api/client-script') {
@@ -621,5 +854,6 @@ ensureDirs();
 loadState();
 pump(); // 重启后继续处理队列里未完成的任务
 ensureFirewall(); // 自动放行防火墙（首次运行会弹一次 UAC）
-console.log('(DRYRUN 测试模式)' );
 if (DRYRUN) console.log('[提示] DRYRUN=1：只走队列流程，不真正打印');
+
+module.exports = { buildClientScript, brandOf, tipBlock, scanJobLanguage, stripJobLanguage, langFlags };

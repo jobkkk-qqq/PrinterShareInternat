@@ -8,6 +8,10 @@ param(
   [Parameter(Mandatory=$true)][string]$DataFile
 )
 
+# 打包版 GUI 运行没有控制台，PowerShell 5.1 会用 OEM 代码页写 stdout/stderr，
+# Node 按 UTF-8 读，下面的中文报错会变成乱码显示在管理页上。强制 UTF-8 输出。
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -23,8 +27,11 @@ public static class WSP {
   [DllImport("winspool.drv", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "OpenPrinterW")]
   public static extern bool OpenPrinter(string pPrinterName, out IntPtr phPrinter, IntPtr pDefault);
 
+  // StartDocPrinterW 的返回值是后台给这次作业分配的作业号（失败时为 0）。
+  // 必须声明成 int 才拿得到它——server.js 要靠这个作业号去打印服务操作日志里
+  // 核对作业到底有没有真的送到打印机端口（WritePrinter 成功只代表后台收下了数据）。
   [DllImport("winspool.drv", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "StartDocPrinterW")]
-  public static extern bool StartDocPrinter(IntPtr hPrinter, int level, ref DOC_INFO_1 di);
+  public static extern int StartDocPrinter(IntPtr hPrinter, int level, ref DOC_INFO_1 di);
 
   [DllImport("winspool.drv", SetLastError = true, EntryPoint = "WritePrinter")]
   public static extern bool WritePrinter(IntPtr hPrinter, byte[] pBytes, int cbBuf, out int pcWritten);
@@ -58,10 +65,12 @@ $di.pOutputFile = $null
 $di.pDatatype = 'RAW'
 
 try {
-  if (-not [WSP]::StartDocPrinter($h, 1, [ref]$di)) {
+  $jobId = [WSP]::StartDocPrinter($h, 1, [ref]$di)
+  if ($jobId -eq 0) {
     Write-Error 'StartDocPrinter 失败'
     exit 3
   }
+  Write-Output "JOBID: $jobId"
 
   $raw = [System.IO.File]::ReadAllBytes($DataFile)
 

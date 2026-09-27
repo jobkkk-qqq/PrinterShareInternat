@@ -123,11 +123,13 @@ after(async () => {
 // ---------- 1. 客户端安装脚本 ----------
 
 test('生成安装脚本：纯 ASCII + 行尾统一 CRLF', () => {
-  const { bat } = srv.buildClientScript('192.168.1.50', 9100, 'HP LaserJet MFP M227-M231 PCL-6');
+  const { bat, batName } = srv.buildClientScript('192.168.1.50', 9100, 'HP LaserJet MFP M227-M231 PCL-6');
   assert.ok(bat.startsWith('@echo off\r\n'), '脚本应以 @echo off 开头');
   assert.equal(/\r\r\n/.test(bat), false, '不能出现 CR CR LF（Windows 检出 + replace(\\n) 的经典错误）');
   assert.equal(/(^|[^\r])\n/.test(bat), false, '不能出现裸 LF');
   assert.equal(/[^\x00-\x7F]/.test(bat), false, '脚本必须是纯 ASCII（中文批处理在 Win7 会闪退）');
+  // zip 内文件名也必须是 ASCII：Win7 自带解压器不认 UTF-8 文件名标志，中文名会解成乱码
+  assert.equal(/[^\x00-\x7F]/.test(batName), false, 'zip 内文件名必须是纯 ASCII');
   assert.ok(bat.includes('set "_HOST=192.168.1.50"\r\n'), '应注入服务器 IP');
   assert.ok(bat.includes('set "_PORT=9100"\r\n'), '应注入端口');
   assert.ok(bat.includes('set "_DRV=HP LaserJet MFP M227-M231 PCL-6"\r\n'), '应注入驱动型号名');
@@ -180,6 +182,17 @@ test('队列：TCP 入队后串行投递并完成', async () => {
   assert.equal(job.bytes, payload.length, '字节数应与客户端发送一致');
   assert.equal(job.printer, '__TestPrinter__', '应投递到配置的打印机');
   assert.equal(fs.existsSync(job.file), true, '已完成任务的数据文件此时仍在磁盘上');
+});
+
+test('未核对状态：核对不了时任务带 verified=false 与原因，管理页据此标注', async () => {
+  // DRYRUN 下没有真正投递，deliver 必须返回 verified=false + note，
+  // 让管理页显示"未核对"而不是假装"已完成"（否则又回到静默假成功）。
+  const job = await enqueueJob(Buffer.from('PCL-JOB-VERIFY\n' + 'D'.repeat(50)), (j) => j.status === 'done', '任务完成');
+  assert.equal(job.verified, false, '未能核对真实结果时必须标记 verified=false');
+  assert.ok(job.note && job.note.length > 0, '未核对必须带原因，供管理页直显');
+
+  const st = await status();
+  assert.equal(st.printLog, true, '/api/status 应带 printLog 字段（DRYRUN 下按可用处理）');
 });
 
 test('清空已完成：只删已清掉任务的数据文件，排队任务的文件必须保留', async () => {

@@ -1,6 +1,6 @@
 {
   "name": "printer-share",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "原始TCP(9100)打印服务器 + 系统托盘：转发到本机打印机，含队列管理与客户端一键安装脚本",
   "author": "printer-share",
   "main": "main.js",
@@ -25,6 +25,7 @@
       "main.js",
       "server.js",
       "winspool.ps1",
+      "printcheck.ps1",
       "make-icon.js",
       "public/**/*",
       "tray-icon.png",

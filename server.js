@@ -21,6 +21,11 @@ const DRYRUN = process.env.DRYRUN === '1'; // 测试用：只走队列流程，�
 const PS = 'powershell';
 const PS_OPTS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass'];
 const WINSPOOL = path.join(__dirname, 'winspool.ps1');
+const PRINTCHECK = path.join(__dirname, 'printcheck.ps1');
+// 无 XPS 管道的直通驱动：把客户端已渲染好的打印机语言字节原样透传给设备。
+const PASSTHRU_DRIVER = 'Generic / Text Only';
+// 承载 RAW 注入的直通队列名。固定名字，便于幂等识别与端口变更时重建。
+const PASSTHRU_QUEUE = 'PrintShare-Passthru';
 
 // PowerShell 在没有控制台时（打包版 GUI 正常运行即如此）用 OEM 代码页写 stdout，
 // Node 按 UTF-8 读取，中文打印机名会变成 U+FFFD 乱码（"M227fdw 财务" -> "M227fdw ���"）。
@@ -49,6 +54,9 @@ const CONFIG = {
   // 确实需要从别的电脑打开管理页时，设 ADMIN_BIND=0.0.0.0（此时会自动放行 8081 防火墙）。
   adminBind: process.env.ADMIN_BIND || '127.0.0.1',
   configFile: path.join(DATA_ROOT, 'config.json'),
+  // 投递后核对真实打印结果的等待上限（秒）。只有确认作业已通过端口送达打印机才算成功；
+  // 后台异常时靠这个上限结束等待，避免队列被一个核对卡住。
+  verifyTimeout: Number(process.env.PRINTSHARE_VERIFY_TIMEOUT) || 30,
 };
 
 // ---------- 状态 ----------
@@ -89,6 +97,55 @@ async function ensureFirewall() {
     setTimeout(() => fs.unlink(ps1, () => {}), 10000); // 稍后清理临时脚本
   });
   console.log('[防火墙] 检测到 TCP 放行规则缺失，已请求管理员授权自动添加...');
+}
+
+// ---------- 打印结果核对所需的日志（单文件部署免手动配置） ----------
+// PrintService/Operational 是诊断日志，Windows 默认关闭；而"作业到底有没有送到打印机"
+// 只能从这里核对（WritePrinter 成功只代表后台收下了数据）。关闭时静默提权开启一次，
+// 否则核对一律返回 unknown，打印失败就没法如实反映在管理页上。
+async function printLogDisabled() {
+  try {
+    const { stdout } = await execFileP(
+      PS,
+      PS_OPTS.concat(['-Command', psCmd("(Get-WinEvent -ListLog 'Microsoft-Windows-PrintService/Operational' -ErrorAction Stop).IsEnabled")]),
+      { maxBuffer: 1e5 }
+    );
+    return /false/i.test(stdout);
+  } catch (_) {
+    return false; // 查不到（日志不存在等）就不折腾
+  }
+}
+
+// 日志是否可用 = "能不能核对真实打印结果"。带 TTL 缓存：管理页每 2.5s 轮询，
+// 不能每次都起一个 PowerShell。null 表示还没检测过。
+let printLogEnabled = null;
+let printLogCheckedAt = 0;
+const PRINTLOG_TTL = 60000;
+async function printLogState() {
+  if (DRYRUN) return true;
+  const now = Date.now();
+  if (printLogEnabled !== null && now - printLogCheckedAt < PRINTLOG_TTL) return printLogEnabled;
+  printLogEnabled = !(await printLogDisabled());
+  printLogCheckedAt = now;
+  return printLogEnabled;
+}
+
+async function ensurePrintLog() {
+  if (DRYRUN) return; // 测试模式不弹 UAC
+  printLogEnabled = !(await printLogDisabled());
+  printLogCheckedAt = Date.now();
+  if (printLogEnabled) return;
+  const ps1 = path.join(os.tmpdir(), `PrintShare-printlog-${process.pid}.ps1`);
+  try {
+    fs.writeFileSync(ps1, 'wevtutil sl Microsoft-Windows-PrintService/Operational /e:true\r\n', 'utf8');
+  } catch (_) { return; }
+  const elevated = `Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','${ps1}'`;
+  execFile(PS, ['-NoProfile', '-Command', elevated], () => {
+    setTimeout(() => fs.unlink(ps1, () => {}), 10000); // 稍后清理临时脚本
+    printLogCheckedAt = 0; // 授权结束后重新检测：用户点了"否"就会一直是 false
+  });
+  console.log('[核对] 打印服务操作日志未开启，已请求管理员授权开启（用于如实反馈打印结果）...');
+  console.log('[核对] 若未授权，真实打印结果将无法核对，管理页会明确标注"未核对"。');
 }
 
 function ensureDirs() { fs.mkdirSync(QUEUE_DIR, { recursive: true }); }
@@ -198,6 +255,84 @@ async function printerDriverModel(queueName) {
   return model;
 }
 
+// 队列名 -> 真正用来注入 RAW 的队列名。
+// 有些驱动是"XPS 管道型"（如 HP DJ 1110 的 mxdwdrv.dll + hpygid20-pipelineconfig.xml），
+// 它们的渲染栈会把 RAW 数据丢给 printfilterpipelinesvc，管道随即崩溃（0x80004005），
+// 作业永远打不出来。这类驱动必须改投"同端口 + 无 XPS 管道"的直通队列
+// （Generic / Text Only），由它把客户端已经渲染好的打印机语言字节原样透传给设备。
+// 管理页里用户选的仍是物理打印机（它决定客户端该装哪个驱动），注入目标在这里改写。
+const injectCache = new Map(); // 队列名 -> { name, at }
+const INJECT_TTL = 30000;
+
+// 确保存在一个"与目标队列同端口 + 直通驱动"的队列来承载 RAW 注入，返回其队列名；
+// 目标本身已是直通驱动、或驱动缺失/创建失败时返回 null（调用方回退按原队列投递）。
+// 驱动已内置时 Windows 允许普通用户 Add-Printer（无需 UAC），所以这一步可以静默完成。
+async function ensurePassthruQueue(queueName) {
+  if (!queueName || DRYRUN) return null;
+  const script =
+    '$q = Get-Printer -Name $env:_Q -ErrorAction SilentlyContinue;' +
+    'if (-not $q) { }' +
+    'elseif ($q.DriverName -eq $env:_D) { $q.Name }' +
+    'else {' +
+    '  $same = Get-Printer | Where-Object { $_.PortName -eq $q.PortName -and $_.DriverName -eq $env:_D -and $_.Name -ne $q.Name } | Select-Object -First 1;' +
+    '  if ($same) { $same.Name }' +
+    '  elseif (Get-PrinterDriver -Name $env:_D -ErrorAction SilentlyContinue) {' +
+    '    $p = Get-Printer -Name $env:_N -ErrorAction SilentlyContinue;' +
+    // 同名的旧队列若挂在别的端口（换了 USB 口/换了打印机）就删掉重建，否则端口会错
+    '    if ($p -and $p.PortName -ne $q.PortName) { Remove-Printer -Name $env:_N -ErrorAction SilentlyContinue; $p = $null };' +
+    '    if (-not $p) { try { Add-Printer -Name $env:_N -DriverName $env:_D -PortName $q.PortName -ErrorAction Stop; $p = Get-Printer -Name $env:_N -ErrorAction SilentlyContinue } catch { $p = $null } };' +
+    '    if ($p) { $p.Name }' +
+    '  }' +
+    '}';
+  try {
+    const { stdout } = await execFileP(
+      PS,
+      PS_OPTS.concat(['-Command', psCmd(script)]),
+      { maxBuffer: 1e6, env: Object.assign({}, process.env, { _Q: queueName, _D: PASSTHRU_DRIVER, _N: PASSTHRU_QUEUE }) }
+    );
+    return stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).pop() || null;
+  } catch (_) { return null; }
+}
+
+async function resolveInjectPrinter(queueName) {
+  if (!queueName || DRYRUN) return queueName;
+  const hit = injectCache.get(queueName);
+  if (hit && Date.now() - hit.at < INJECT_TTL) return hit.name;
+  let name = queueName;
+  const found = await ensurePassthruQueue(queueName);
+  if (found) name = found;
+  else console.warn(`[队列] 未找到直通队列，${queueName} 按原队列投递（XPS 管道型驱动可能打不出来）`);
+  injectCache.set(queueName, { name, at: Date.now() });
+  return name;
+}
+
+// 队列名 -> 端口名。用来识别"根本到不了物理打印机"的队列。
+const portCache = new Map(); // 队列名 -> { port, at }
+async function printerPortOf(queueName) {
+  if (!queueName || DRYRUN) return null;
+  const hit = portCache.get(queueName);
+  if (hit && Date.now() - hit.at < INJECT_TTL) return hit.port;
+  let port = null;
+  try {
+    const { stdout } = await execFileP(
+      PS,
+      PS_OPTS.concat(['-Command', psCmd('(Get-Printer -Name $env:_Q -ErrorAction SilentlyContinue).PortName')]),
+      { maxBuffer: 1e5, env: Object.assign({}, process.env, { _Q: queueName }) }
+    );
+    port = stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).pop() || null;
+  } catch (_) { port = null; }
+  portCache.set(queueName, { port, at: Date.now() });
+  return port;
+}
+
+// 文件端口（C:\...\x.prn）、PORTPROMPT:（"Microsoft Print to PDF"）、nul:（"OneNote"）
+// 都不会把数据送到物理打印机：内容只会写进文件或弹保存框，但打印后台照样记 307「已打印」。
+// 不拦的话管理页会显示"已完成"而打印机毫无动作——最误导人的那种假成功。
+function isNonDevicePort(port) {
+  if (!port) return false; // 查不到端口就不拦，宁可漏报也不误报
+  return /^[A-Za-z]:[\\/]/.test(port) || /^PORTPROMPT:/i.test(port) || /^(nul|FILE):/i.test(port);
+}
+
 // 生成的 .bat 必须纯 ASCII：非 ASCII 字节在 Win7 的 cmd 下会解析错乱甚至闪退
 //（UTF-8 中文批处理 + chcp 65001 是已知的崩溃组合）。这里把所有注入值收敛到
 // 可打印 ASCII，并去掉会破坏 `set "X=..."` 的引号与 %（% 会被当变量展开），
@@ -219,16 +354,63 @@ function nextJob() {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-async function runWinspool(job) {
+async function runWinspool(job, injectName) {
+  const startedAt = Date.now();
   try {
-    const { stderr } = await execFileP(
+    const { stdout, stderr } = await execFileP(
       PS,
-      PS_OPTS.concat(['-File', WINSPOOL, '-PrinterName', job.printer, '-DataFile', job.file]),
+      PS_OPTS.concat(['-File', WINSPOOL, '-PrinterName', injectName || job.printer, '-DataFile', job.file]),
       { maxBuffer: 1e7, timeout: 120000 }
     );
-    return { ok: true, err: stderr ? stderr.trim() : '' };
+    // 后台给这次作业分配的作业号，用来核对真实结果
+    const jobId = Number((/JOBID:\s*(\d+)/.exec(stdout) || [])[1]) || null;
+    return { ok: true, err: stderr ? stderr.trim() : '', jobId, startedAt };
   } catch (e) {
-    return { ok: false, err: String((e.stderr || e.message || e)).trim() };
+    return { ok: false, err: String((e.stderr || e.message || e)).trim(), jobId: null, startedAt };
+  }
+}
+
+// WritePrinter 返回成功只代表打印后台"收下了数据"，不代表数据送到了打印机端口：
+// 驱动/打印处理器异常（如 HP DJ 1110 的 XPS 管道崩溃）或后台卡死时，作业会被静默删除，
+// 而投递方早已拿到成功返回——以前这里就会把根本没打出来的任务记成"已完成"。
+// 改为按后台作业号核对打印服务操作日志，只有确认作业已通过端口送达打印机才算成功。
+//
+// 返回值：
+//   ok       是否算作"打印成功"
+//   err      失败原因（ok=false 时）
+//   verified 是否真的核对到了结果。false = 核对不了（日志未开启/查不到该作业/核对出错），
+//            此时按投递结果处理，但调用方必须在列表里标明"未核对"，不能当成已确认。
+//   note     verified=false 时给人看的原因
+async function verifyPrint(jobId, sinceMs) {
+  if (!jobId) {
+    return { ok: true, err: '', verified: false, note: '未取到打印后台的作业号，无法核对真实结果' };
+  }
+  try {
+    const { stdout } = await execFileP(
+      PS,
+      PS_OPTS.concat(['-File', PRINTCHECK, '-JobId', String(jobId),
+        '-SinceUtc', new Date(sinceMs).toISOString(),
+        '-TimeoutSeconds', String(CONFIG.verifyTimeout)]),
+      { maxBuffer: 1e6, timeout: (CONFIG.verifyTimeout + 20) * 1000 }
+    );
+    const verdict = (/VERDICT:\s*(\S+)/.exec(stdout) || [])[1] || 'unknown';
+    const detail = (/DETAIL:\s*(.+)/.exec(stdout) || [])[1] || '';
+    if (verdict === 'printed') return { ok: true, err: '', verified: true };
+    // unknown = 核对不了（日志被关掉、日志里查不到该作业），不能据此判失败，
+    // 但也不能假装核对过了：带上 verified=false 让管理页如实标注"未核对"。
+    if (verdict === 'unknown') {
+      const on = await printLogState();
+      return {
+        ok: true, err: '', verified: false,
+        note: on
+          ? '打印服务操作日志中查不到该作业，未能核对真实结果'
+          : '打印服务操作日志未开启，无法核对真实结果（仅反映投递结果）',
+      };
+    }
+    return { ok: false, err: detail || `打印未成功（${verdict}）`, verified: true };
+  } catch (_) {
+    // 核对本身出错时不误判成打印失败，但同样标明"未核对"
+    return { ok: true, err: '', verified: false, note: '核对过程出错，未能核对真实结果' };
   }
 }
 
@@ -249,10 +431,12 @@ function applyStrip(job) {
   }
 }
 
-async function deliver(job) {
+async function deliver(job, injectName) {
   if (stripLang && langFlags(job.lang).length) applyStrip(job);
-  if (DRYRUN) { await sleep(1200); return { ok: true, err: '' }; }       // 测试：模拟投递耗时
-  return runWinspool(job);
+  if (DRYRUN) { await sleep(1200); return { ok: true, err: '', verified: false, note: 'DRYRUN 模式：只走队列流程，未真正投递' }; }
+  const r = await runWinspool(job, injectName);
+  if (!r.ok) return r;
+  return verifyPrint(r.jobId, r.startedAt);
 }
 
 // 单 worker 串行泵：同一时刻只送一个任务给 spooler
@@ -274,14 +458,35 @@ async function pump() {
         break;
       }
 
+      // 目标端口是文件/弹窗（如调试用的文件端口队列、"Microsoft Print to PDF"）时，
+      // 打印内容根本到不了物理打印机，但后台仍会记「已打印」。这里直接如实报失败，
+      // 避免管理页显示"已完成"而打印机毫无动作。
+      const targetPort = await printerPortOf(job.printer);
+      if (isNonDevicePort(targetPort)) {
+        job.status = 'failed';
+        job.finishedAt = Date.now();
+        job.error = `打印机「${job.printer}」的端口是 ${targetPort}，内容只会写入文件、不会送到物理打印机；请在管理页改选真实打印机`;
+        persist();
+        console.warn(`[队列] 失败   任务#${job.seq} -> ${job.error}`);
+        continue;
+      }
+
+      // XPS 管道型驱动（HP DJ 1110 等）收到 RAW 会让 printfilterpipelinesvc 崩溃，
+      // 这里自动改投同端口的直通队列（Generic / Text Only）
+      const injectTo = await resolveInjectPrinter(job.printer);
       job.status = 'printing'; job.startedAt = Date.now(); persist();
-      console.log(`[队列] 打印中 任务#${job.seq} -> ${job.printer}（${job.bytes} 字节）`);
-      const r = await deliver(job);
+      console.log(`[队列] 打印中 任务#${job.seq} -> ${injectTo}${injectTo === job.printer ? '' : `（直通改写自 ${job.printer}）`}（${job.bytes} 字节）`);
+      const r = await deliver(job, injectTo);
       job.finishedAt = Date.now();
       job.status = r.ok ? 'done' : 'failed';
       job.error = r.ok ? (r.err || null) : r.err;
+      // 如实记录核对结果：verified=false 表示"投递成功但没能核对真实结果"
+      //（日志未开启/查不到该作业），管理页必须据此标注"未核对"，不能当成已确认。
+      job.verified = r.verified === true;
+      job.note = r.note || null;
       persist();
-      console.log(`[队列] 完成   任务#${job.seq} -> ${job.status}`);
+      if (r.ok) console.log(`[队列] 完成   任务#${job.seq} -> ${job.verified ? '已确认送达打印机' : `已投递但未核对（${job.note || '未知原因'}）`}`);
+      else console.warn(`[队列] 失败   任务#${job.seq} -> ${job.error}`);
     }
   } finally {
     pumping = false;
@@ -523,7 +728,7 @@ function stripJobLanguage(buf) {
   return { buf: buf.slice(i, end), removed: buf.length - (end - i) };
 }
 
-// 生成客户端一键安装脚本：安装共享打印机.bat —— 纯 Batch 单文件、可读可审计
+// 生成客户端一键安装脚本：install-printer.bat —— 纯 Batch 单文件、可读可审计
 //   （先只读校验、后最小提权修改、失败不破坏原配置），跨 Win7/8/10/11。
 // 编码：整个 bat 只用 ASCII（英文提示），不用 chcp/UTF-8 —— UTF-8 中文批处理在
 //   Win7 的 chcp 65001 下会解析错乱闪退，部分 Win10 配置也会丢失中文，纯 ASCII
@@ -731,7 +936,7 @@ echo   original configuration was preserved as much as possible.
 pause
 exit /b 1`.replace(/\r\n|\r/g, '\n').replace(/\n/g, '\r\n');
 
-  return { bat, ps1Name: null, batName: '安装共享打印机.bat', ps1: null };
+  return { bat, ps1Name: null, batName: 'install-printer.bat', ps1: null };
 }
 
 // 极简 ZIP 打包（STORE 不压缩，仅用于把客户端安装脚本打成单个可下载包，零依赖）
@@ -834,7 +1039,11 @@ const adminServer = http.createServer(async (req, res) => {
     if (!def && printers.length) def = printers[0];
     const queue = [...jobs].sort((a, b) => (a.createdAt - b.createdAt));
     const preferredIP = await preferredHostIP();
-    return sendJson(res, { rawPort: CONFIG.rawPort, adminPort: CONFIG.adminPort, targetPrinter, defaultPrinter: def, printers, paused: globalPaused, stripLang, serverIPs: serverIPs(), preferredIP, queue });
+    // 不阻塞状态轮询：只回报"已知"的日志状态；还没检测过时先按可用处理，
+    // 后台异步补一次检测（printLogState 自带 TTL 缓存）。
+    if (printLogEnabled === null) printLogState().catch(() => {});
+    const printLog = printLogEnabled !== false;
+    return sendJson(res, { rawPort: CONFIG.rawPort, adminPort: CONFIG.adminPort, targetPrinter, defaultPrinter: def, printers, paused: globalPaused, stripLang, serverIPs: serverIPs(), preferredIP, queue, printLog });
   }
 
   if (url === '/api/printer' && method === 'POST') {
@@ -845,7 +1054,14 @@ const adminServer = http.createServer(async (req, res) => {
         if (name) { const printers = await listPrinters(); targetPrinter = printers.includes(name) ? name : targetPrinter; }
         else targetPrinter = null;
         persistConfig();
-        printerCache = null; defCacheAt = 0; // 让下次 /api/status 重新枚举
+        printerCache = null; defCacheAt = 0; injectCache.clear(); // 让下次 /api/status 重新枚举，并重新解析注入队列
+        // 选定打印机后立刻在后台备好直通队列（不阻塞响应）：首个任务投递时无需等待建队列
+        if (targetPrinter) {
+          resolveInjectPrinter(targetPrinter).then((injectTo) => {
+            if (injectTo !== targetPrinter) console.log(`[队列] 注入目标：${targetPrinter} -> ${injectTo}`);
+            printerCache = null; // 新建的直通队列要出现在管理页列表里
+          }).catch(() => {});
+        }
         // 已入队未指定打印机的任务沿用新选择
         jobs.forEach((j) => { if (!j.printer && j.status === 'queued') j.printer = targetPrinter; });
         persist(); pump();
@@ -948,6 +1164,7 @@ cleanOrphanIngest();
 loadState();
 pump(); // 重启后继续处理队列里未完成的任务
 ensureFirewall(); // 自动放行防火墙（首次运行会弹一次 UAC）
+ensurePrintLog(); // 自动开启打印服务操作日志（核对打印结果用，默认关闭时弹一次 UAC）
 if (DRYRUN) console.log('[提示] DRYRUN=1：只走队列流程，不真正打印');
 
 // tcpServer / adminServer 也导出：自动化测试要能在同一个进程里把服务关掉

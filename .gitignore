@@ -3,6 +3,7 @@ node_modules/
 dist/
 .buildcache/
 .electron-cache/
+.eu/
 .npmcache/
 .env
 .trae-html-share-packages/
@@ -16,6 +17,5 @@ queue/*
 !queue/.gitkeep
 config.json
 
-# 旧版客户端脚本（含本机 IP，已由运行期生成的纯 BAT 单文件取代）
-client-install.ps1
-安装共享打印机.bat
+# 客户端安装脚本（运行期按需生成下载；若落到项目目录不入库）
+install-printer.bat

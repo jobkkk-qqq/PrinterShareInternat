@@ -38,6 +38,11 @@
   th{color:var(--muted);font-weight:normal;white-space:nowrap}
   .ops{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
   .ops button{font-size:15px;padding:5px 10px}
+  /* 失败原因：红色直显在列表里，老年用户不用悬停也能看清为什么没打出来 */
+  .failline{color:var(--err);font-size:14px;line-height:1.35;max-width:320px}
+  /* 未核对：投递成功但没能核对到真实结果——黄色直显，绝不伪装成"已完成" */
+  .noteline{color:#9a6b00;font-size:14px;line-height:1.35;max-width:320px}
+  .warnbadge{background:rgba(239,170,23,.18);color:#9a6b00}
   .noc{color:var(--muted);padding:18px;text-align:center}
   code{background:var(--soft);border-radius:6px;padding:1px 7px;font-family:Consolas,monospace;font-size:15px}
   .badsmall{padding:2px 10px;border-radius:999px;background:var(--soft);color:var(--muted);font-size:13px}
@@ -61,7 +66,7 @@
   <div class="card">
     <h2>客户端一键安装脚本</h2>
     <div class="hint" style="margin-bottom:12px">
-      点击生成会下载一个 <strong>zip 安装包</strong>，内含单个可执行文件 <code>安装共享打印机.bat</code>（跨 Windows 7/8/10/11）。把它复制到局域网内其它电脑，解压后<strong>双击 .bat</strong> 运行即可，无需额外文件。<br>
+      点击生成会下载一个 <strong>zip 安装包</strong>，内含单个可执行文件 <code>install-printer.bat</code>（跨 Windows 7/8/10/11）。把它复制到局域网内其它电脑，解压后<strong>双击 .bat</strong> 运行即可，无需额外文件。<br>
       该 .bat 是可读脚本，先用记事本打开<b>核对服务器IP/驱动</b>再运行；执行会先验证服务器可达、检查驱动、只对"本脚本创建的对象"操作，删除/重建前会询问，失败不会破坏原配置。
     </div>
     <div class="row">
@@ -103,6 +108,7 @@
       <button id="clearBtn" class="ghost">清空已完成</button>
       <span class="hint">优先级数字越大越先打，用 + / − 调整</span>
     </div>
+    <div class="hint" id="logWarn" style="display:none;color:#9a6b00;background:rgba(239,170,23,.10);border:1px solid rgba(239,170,23,.35);border-radius:8px;padding:8px 12px;margin-bottom:12px"></div>
     <table>
       <thead>
         <tr><th>#</th><th>时间</th><th>来源</th><th>目标打印机</th><th>优先级</th><th>状态</th><th>操作</th></tr>
@@ -114,7 +120,7 @@
 </div>
 
 <script>
-  var state = { paused:false, printers:[], targetPrinter:null, queue:[], serverIPs:[], preferredIP:null, stripLang:false };
+  var state = { paused:false, printers:[], targetPrinter:null, queue:[], serverIPs:[], preferredIP:null, stripLang:false, printLog:true };
   var printerTouched = false; // 用户是否手动改过打印机下拉（防止 2.5s 刷新把手选值顶回去）
 
   function $(id){ return document.getElementById(id); }
@@ -127,7 +133,16 @@
     var txt = j.paused ? '排队中(已暂停)' : m.t;
     return '<span class="pill ' + m.c + '">' + txt + '</span>';
   }
+  // 未核对标记：投递成功了，但没能从打印服务日志核对到真实结果
+  //（日志未开启 / 查不到该作业）。这不是"已完成"，必须让用户看得见。
+  function verifyBadge(j){
+    if(j.verified !== false) return '';
+    var note = j.note || '未能核对真实打印结果';
+    return ' <span class="badsmall warnbadge" title="' + esc(note) + '">未核对</span>';
+  }
   function timeOf(t){ return t? new Date(t).toLocaleTimeString() : '—'; }
+  // 失败原因直接显示在列表里（完整文本放 title）：打印没成功时用户要一眼看见为什么
+  function shortErr(s){ s = String(s||'').replace(/\s+/g,' '); return s.length > 40 ? s.slice(0,40)+'…' : s; }
 
   // 作业语言前导标记：提示这条任务可能对应纸面乱码
   function langFlagsOf(j){
@@ -183,6 +198,12 @@
     // 数量
     var run = state.queue.filter(function(j){ return j.status==='queued'||j.status==='printing'; }).length;
     $('queueCount').textContent = run + ' 个待处理 / ' + state.queue.length + ' 总';
+    // 日志未开启时全局提示：无法核对真实结果，别把"已投递"当成"已打印"
+    var lw = $('logWarn');
+    if(state.printLog === false){
+      lw.style.display = 'block';
+      lw.textContent = '⚠ 打印服务操作日志未开启，无法核对打印是否真正送达打印机：列表里的「已完成」仅表示数据已交给后台，请以打印机实际出纸为准。重启本程序会自动请求授权开启。';
+    } else lw.style.display = 'none';
     $('pauseBtn').textContent = state.paused ? '▶ 继续队列' : '⏸ 全局暂停';
     // 协商前导统计与开关
     var langN = state.queue.filter(function(j){ return langFlagsOf(j).length; }).length;
@@ -200,14 +221,16 @@
         ops += '<button class="danger" data-c="'+j.id+'">取消</button>';
       }
       if(j.status==='printing') ops = '<span class="hint">打印中…</span>';
-      if(j.status==='failed' && j.error) ops = '<span class="hint" title="'+esc(j.error)+'">失败原因</span>';
+      if(j.status==='failed' && j.error) ops = '<span class="failline" title="'+esc(j.error)+'">'+esc(shortErr(j.error))+'</span>';
+      // 已完成但未核对：把"为什么没核对上"直接写出来，不让人以为万事大吉
+      if(j.status==='done' && j.verified===false) ops = '<span class="noteline" title="'+esc(j.note)+'">'+esc(shortErr(j.note||'未能核对真实打印结果'))+'</span>';
       return '<tr>' +
         '<td>#'+j.seq+'</td>' +
         '<td>'+timeOf(j.createdAt)+'</td>' +
         '<td><span title="'+esc(j.from)+'">'+esc(fmtSrc(j.from))+'</span></td>' +
         '<td>'+(j.printer ? esc(j.printer) : '<span class="hint">未选择打印机</span>')+' <span class="hint">('+fmtBytes(j.bytes)+')</span></td>' +
         '<td class="pri">'+j.priority+'</td>' +
-        '<td>'+statusPill(j)+langBadge(j)+'</td>' +
+        '<td>'+statusPill(j)+verifyBadge(j)+langBadge(j)+'</td>' +
         '<td class="ops">'+ops+'</td>' +
         '</tr>';
     }).join('');
@@ -253,7 +276,7 @@
       } else {
         var blob = await resp.blob();
         downloadBlob(blob, '打印客户端安装包_'+host+'.zip');
-        alert('已下载 zip 安装包（内含单个安装脚本 安装共享打印机.bat，指向 '+host+'，共享打印机 '+driver+'，脚本内自动取驱动型号名）。\n请把 zip 复制到局域网内其它电脑，解压后直接双击 .bat 运行即可（跨 Win7-11，无需其它文件）。\n可先用记事本打开 .bat 核对 IP/驱动。');
+        alert('已下载 zip 安装包（内含单个安装脚本 install-printer.bat，指向 '+host+'，共享打印机 '+driver+'，脚本内自动取驱动型号名）。\n请把 zip 复制到局域网内其它电脑，解压后直接双击 .bat 运行即可（跨 Win7-11，无需其它文件）。\n可先用记事本打开 .bat 核对 IP/驱动。');
       }
     } catch(e){ alert('生成失败：无法连接服务器'); }
     $('genBtn').disabled = false; $('genBtn').textContent = '⬇ 下载 zip 安装包';
@@ -264,6 +287,7 @@
       var st = await (await fetch('/api/status')).json();
       state.paused = st.paused; state.printers = st.printers||[];
       state.stripLang = !!st.stripLang;
+      state.printLog = st.printLog !== false;
       state.targetPrinter = st.targetPrinter; state.defaultPrinter = st.defaultPrinter;
       state.queue = st.queue||[];
       state.serverIPs = st.serverIPs||[];

@@ -13,7 +13,7 @@
   <img alt="Windows" src="https://img.shields.io/badge/Platform-Windows%207%2F8%2F10%2F11-blue?logo=windows&logoColor=white">
   <img alt="Node" src="https://img.shields.io/badge/Node.js-%E2%89%A5%2018-green?logo=node.js&logoColor=white">
   <img alt="Electron" src="https://img.shields.io/badge/Electron-31-purple?logo=electron&logoColor=white">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.3.0-orange">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.4.0-orange">
   <img alt="License" src="https://img.shields.io/badge/License-MIT-lightgrey">
   <img alt="Type3 raw" src="https://img.shields.io/badge/协议-RAW%20(TCP%209100)-informational">
 </p>
@@ -97,17 +97,22 @@
   否则只要关掉日志就能无限白嫖，配额形同虚设。
 - **用满后的行为**：新任务**不投递给打印机**，但会留在队列里并明确标注「已拒收：配额已用完…」；
   续期成功后自动放回队列继续打印，不会静默丢件。
-- **注册码与 PDFconvertAdd 通用**：同一套机器码算法、同一个签名密钥、同一种四段格式：
+- **注册码与 PDFconvertAdd 通用**：同一套机器码算法、同一把密钥体系、同一种四段格式。签名用
+  **Ed25519 非对称算法**——程序里只内置**公钥**（只能验签），签名私钥只留在开发者本机：
 
   ```
-  PDF - XXXXXXXX - NNNN - YYYYYYYY
-         │          │       └─ HMAC-SHA256(密钥, "PDF-{前缀}-{序列号}") 前 8 位
+  PDF - XXXXXXXX - NNNN - <Base32 签名>
+         │          │       └─ Ed25519 签名（64 字节 → Base32 103 字符，无填充）
          │          └─ 序列号（第几次授权）—— 续期就把它 +1
          └─ 机器码前 8 位（绑定机器）
   ```
 
-  所以**同一个生成器**既能为 PDFconvertAdd 发码，也能为本程序发码：本仓库的 `gen-license.js` 与
-  PDFconvertAdd 的 `licensing/scripts/generate_license.py` 输出**逐字符一致**（已交叉验证）。
+  所以**同一把私钥**既能为 PDFconvertAdd 发码，也能为本程序发码：本仓库的 `gen-license.js` 与
+  PDFconvertAdd 的 `licensing/scripts/generate_license.py` 输出**逐字符一致**（已用真实机器码交叉验证）。
+  即使程序与源码完全公开，也造不出有效注册码——公钥只能验签，签发必须用私钥。
+
+  > 注册码整串约 **121 个字符**：Ed25519 签名**不可截断**（验签需要完整的 R 与 S 各 32 字节），
+  > 这是非对称签名的固有代价。用户复制粘贴即可，不需要手输。
 
 **发码 / 续期流程**
 
@@ -122,6 +127,12 @@
    ```
 
 3. 把注册码粘回管理页「注册 / 续期」并保存即可。
+
+> **私钥放哪（开发者必读）**：`gen-license.js` 按以下顺序查找私钥，第一个存在的即用 ——
+> 环境变量 `LICENSE_PRIVATE_KEY` → `<仓库根>/license-private-key.json` →
+> `<仓库根>/../license-keys/license-private-key.json` → `~/.license-keys/private-key.json`。
+> 私钥**不进仓库、不进 exe**（`.gitignore` 已排除），丢失后只能换密钥对并让所有用户重新注册，请务必备份。
+> **程序里没有私钥**：`license.js` 只内置公钥，即便被反编译也无法签发注册码。
 
 > **序列号必须一次比一次大。** 程序记录本机用过的最大序列号，只接受序列号更大的注册码。这既保证
 > "过期后拿到的注册码跟上一张不一样"，也让旧码无法被重复使用或回滚。
@@ -249,9 +260,9 @@ server.js          核心打印服务：TCP 9100 收流 → 磁盘队列 → 串
                    （含直通队列自动改写、非物理端口守卫、投递后结果核对）
 winspool.ps1       PowerShell P/Invoke，把数据交给本机打印机（零原生依赖，含前导0剥离）
 printcheck.ps1     读打印服务操作日志，核对作业是否真正送达打印机端口
-license.js         注册授权：机器码计算 + 注册码验签 + 授权/配额状态机（与 PDFconvertAdd 通用）
+license.js         注册授权：机器码计算 + 注册码验签（**只内置公钥，无法签发**）+ 授权/配额状态机
 machinecode.ps1    采集硬件组件算机器码（MAC 用 UuidCreateSequential，与 CPython 一致）
-gen-license.js     开发者发码工具：按机器码 + 序列号生成注册码（与 Python 生成器输出一致）
+gen-license.js     开发者发码工具：用**本机私钥**做 Ed25519 签名生成注册码（私钥不在仓库内）
 public/index.html  Web 管理页：打印机选择、注册授权、队列可视化、客户端脚本生成
 make-icon.js       生成托盘/应用图标（ico/png）
 build.bat          一键打包脚本（内置镜像与缓存路径）
@@ -341,6 +352,24 @@ test/              零依赖回归测试（node --test：队列 / 清空已完�
 - [ ] 打印机多实例 / 一台主机管理多台打印机
 
 ## 📝 更新日志
+
+### 0.4.0
+
+**安全 · 注册码改用 Ed25519 非对称签名（与 PDFconvertAdd 保持通用）**
+
+- **程序内只保留公钥**：`license.js` 不再含任何签名能力，也不再残留对称密钥，只能验签。
+  签发注册码所需的**私钥只在开发者本机**（`gen-license.js` 从仓库外读取），不进仓库、不进 exe。
+  旧版用对称 HMAC，验签密钥必须随程序分发，等于把发码器交给每个用户。
+- **许可码格式变更**：`PDF-XXXXXXXX-NNNN-<Base32 签名>`，整串约 121 字符。
+  Ed25519 签名 64 字节**不可截断**（验签需要完整的 R 与 S 各 32 字节），这是码变长的原因。
+- **旧格式注册码全部失效**（旧码末段是 8 位十六进制，新格式是 103 位 Base32，长度即可区分）。
+- 配额规则不变：未注册试用 20 份、每次授权 500 份、序列号必须递增。
+- 回归测试改为使用**预先生成的固定向量**（Ed25519 签名确定），因此测试过程完全不需要私钥，
+  同时新增断言"`license.js` 里不存在签发函数、不残留对称密钥"。
+
+**变更**
+
+- 管理页「注册授权」卡片补充注册码长度与"请完整复制粘贴"的提示。
 
 ### 0.3.0
 

@@ -1,25 +1,25 @@
 'use strict';
 /*
- * 注册授权模块 —— 与 PDFconvertAdd 通用
+ * 注册授权模块 —— 与 PDFconvertAdd 通用（Ed25519 非对称签名）
  *
- * 三要素刻意与 PDFconvertAdd 保持逐字节一致，改动任何一个都会让两个程序发出的
- * 注册码互不通用：
- *   1) 注册码前缀  PDF
- *   2) 签名密钥    DEVELOPER_SECRET
- *   3) 机器码算法  组件顺序 CPU->BOARD->MAC->HDD，SHA256 取前 16 位十六进制
+ * 本模块只做**验签**，内置的是一把**公钥**：它只能验证许可码，**无法生成**。
+ * 签名用的私钥只留在开发者本机（见 gen-license.js 与 license-keys/ 目录），
+ * 既不进仓库也不进 exe —— 所以即使把程序和源码完全公开，也造不出有效许可码。
  *
- * 注册码格式（四段）：
- *   PDF - XXXXXXXX - NNNN - YYYYYYYY
- *          │          │       └─ HMAC-SHA256(密钥, "PDF-{前缀}-{序列号}") 前 8 位
- *          │          └─ 序列号（4 位数字）= "第几次授权"，续期就是把它 +1
+ * 许可码格式（四段）：
+ *   PDF - XXXXXXXX - NNNN - <Base32 签名>
+ *          │          │       └─ Ed25519 签名（64 字节 → Base32 103 字符，无填充）
+ *          │          └─ 序列号（4 位数字）= "第几次授权"，续期即把它 +1
  *          └─ 机器码前 8 位（绑定机器）
  *
- * 序列号是这里唯一能区分"新旧注册码"的变量：同一台机器每次续期都要用更大的
- * 序列号，因此每次拿到的注册码都不同，旧码也无法被再次拿来注册。
+ * 被签名内容：UTF-8 字符串 "PDF-{机器码前8位}-{序列号4位}"
  *
- * 配额规则（本程序特有，与 PDFconvertAdd 的 20 份/授权不同）：
- *   - 未注册：白送 TRIAL_LIMIT 次
- *   - 已注册：每次授权 LICENSE_LIMIT 次，用满必须凭新注册码续期
+ * 注意：Ed25519 签名必须完整保留，**不能截断**（验签需要完整的 R 与 S 各 32 字节），
+ * 这是整串许可码长达 121 字符的原因。
+ *
+ * 配额规则：
+ *   - 未注册：试用 TRIAL_LIMIT 次
+ *   - 已注册：每次授权 LICENSE_LIMIT 次，用满必须凭**序列号更大**的新许可码续期
  *   - 只有"确认打印成功"才扣次数（失败/卡纸不扣）
  */
 
@@ -38,7 +38,10 @@ const MACHINECODE_PS1 = path.join(__dirname, 'machinecode.ps1');
 
 // ---- 与 PDFconvertAdd 对齐的常量（改动即失去通用性）----
 const LICENSE_PREFIX = 'PDF';
-const DEVELOPER_SECRET = 'PDFConverter2026_SecretKey_v1.0';
+// 公钥：公开无妨（只能验签）。与 PDFconvertAdd 内置的是同一把。
+const PUBLIC_KEY_HEX = '324B31ED07C4C8772BAD3D5DDAE01F907D9226921C64D928F6D298780A8804C0';
+// 裸 32 字节公钥前面要补的 SPKI(DER) 头，Node 才能当公钥对象用
+const SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 
 // ---- 本程序的配额（可独立调整，不影响通用性）----
 // 支持环境变量覆盖：自动化测试要构造"刚好用满"的场景
@@ -46,16 +49,41 @@ const TRIAL_LIMIT = Number(process.env.PRINTSHARE_TRIAL_LIMIT) || 20;    // 未�
 const LICENSE_LIMIT = Number(process.env.PRINTSHARE_LICENSE_LIMIT) || 500; // 每次注册授权可打印的份数
 
 const MACHINE_RE = /^[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}$/;
-const LICENSE_RE = /^PDF-([A-F0-9]{8})-(\d{4})-([A-F0-9]{8})$/;
+const BASE32_RE = /^[A-Z2-7]+$/;
+
+let publicKeyObject = null;
+function publicKey() {
+  if (!publicKeyObject) {
+    publicKeyObject = crypto.createPublicKey({
+      key: Buffer.concat([SPKI_PREFIX, Buffer.from(PUBLIC_KEY_HEX, 'hex')]),
+      format: 'der',
+      type: 'spki',
+    });
+  }
+  return publicKeyObject;
+}
+
+// RFC 4648 Base32（大写、无填充）
+const B32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function base32Decode(s) {
+  let bits = 0;
+  let value = 0;
+  const out = [];
+  for (const ch of s) {
+    const idx = B32_ALPHABET.indexOf(ch);
+    if (idx < 0) throw new Error('bad base32');
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(out);
+}
 
 function sha256Upper(s) {
   return crypto.createHash('sha256').update(s, 'utf8').digest('hex').toUpperCase();
-}
-
-function signatureOf(machinePrefix, serial) {
-  const msg = `${LICENSE_PREFIX}-${machinePrefix}-${String(serial).padStart(4, '0')}`;
-  return crypto.createHmac('sha256', Buffer.from(DEVELOPER_SECRET, 'utf8'))
-    .update(msg, 'utf8').digest('hex').toUpperCase().slice(0, 8);
 }
 
 function machinePrefixOf(machineCode) {
@@ -64,7 +92,7 @@ function machinePrefixOf(machineCode) {
 
 // ---------- 机器码 ----------
 // 纯函数，便于离线单测：给定硬件组件算出机器码。
-// 严格对齐 get_machine_code.py 的 generate_machine_code()：
+// 与 PDFconvertAdd 的 get_machine_code.py 严格对齐：
 //   - 组件按 CPU/BOARD/MAC/HDD 顺序加入，带前缀，以 "|" 连接
 //   - 一个组件都没有时退化为 FALLBACK:<主机名>
 //   - SHA256 -> 大写十六进制 -> 取前 16 位 -> 每 4 位一组拼 XXXX-XXXX-XXXX-XXXX
@@ -81,7 +109,7 @@ function composeMachineCode(parts, hostname) {
   return { code, components };
 }
 
-// 读取硬件组件（实际查询在 machinecode.ps1，保持与 Python 端同源）
+// 读取硬件组件（实际查询在 machinecode.ps1，与 Python 端同源）
 async function readHardwareParts() {
   const { stdout } = await execFileP(
     PS,
@@ -121,33 +149,48 @@ async function getMachineCode() {
 
 function forgetMachineCode() { machineCodeCache = null; }
 
-// ---------- 注册码 ----------
+// ---------- 许可码（只验签，不签发）----------
 function parseLicenseCode(code) {
-  const m = LICENSE_RE.exec(String(code || '').trim().toUpperCase());
-  if (!m) return null;
-  return { machinePrefix: m[1], serial: parseInt(m[2], 10), signature: m[3] };
+  if (!code) return null;
+  const parts = String(code).trim().toUpperCase().split('-');
+  if (parts.length !== 4 || parts[0] !== LICENSE_PREFIX) return null;
+  const [, mp, serialStr, sig32] = parts;
+  if (mp.length !== 8 || !/^[0-9A-F]{8}$/.test(mp)) return null;
+  if (serialStr.length !== 4 || !/^\d{4}$/.test(serialStr)) return null;
+  if (!sig32 || !BASE32_RE.test(sig32)) return null;
+  return { machinePrefix: mp, serial: parseInt(serialStr, 10), sig32 };
 }
 
-// 与 generate_license.py 的 verify_license_code() 等价：
-// 用注册码里内嵌的序列号重算校验位，因此天然支持续期（序列号 >= 2）
+// 用内置公钥验签。返回 { ok, reason, serial }
 function verifyLicenseCode(code, machineCode) {
   const parsed = parseLicenseCode(code);
-  if (!parsed) return { ok: false, reason: '注册码格式无效（应形如 PDF-XXXXXXXX-0000-XXXXXXXX）' };
+  if (!parsed) return { ok: false, reason: '注册码格式无效（应形如 PDF-XXXXXXXX-0000-<Base32 签名>）' };
   const machine = String(machineCode || '').trim().toUpperCase();
   if (!MACHINE_RE.test(machine)) return { ok: false, reason: '机器码格式无效' };
   if (parsed.serial < 1) return { ok: false, reason: '注册码序列号无效' };
-  const prefix = machinePrefixOf(machine);
-  if (parsed.machinePrefix !== prefix) return { ok: false, reason: '注册码与本机机器码不匹配（不是这台机器的注册码）' };
-  if (parsed.signature !== signatureOf(prefix, parsed.serial)) return { ok: false, reason: '注册码校验失败（校验位不对，可能是伪造或输错）' };
-  return { ok: true, serial: parsed.serial };
-}
-
-// 开发者发码用；与 generate_license.py 的 generate_license_code() 输出一致
-function generateLicenseCode(machineCode, serial) {
-  const machine = String(machineCode || '').trim().toUpperCase();
-  if (!MACHINE_RE.test(machine)) throw new Error(`无效的机器码格式: ${machineCode}`);
-  const prefix = machinePrefixOf(machine);
-  return `${LICENSE_PREFIX}-${prefix}-${String(serial).padStart(4, '0')}-${signatureOf(prefix, serial)}`;
+  if (parsed.machinePrefix !== machinePrefixOf(machine)) {
+    return { ok: false, reason: '注册码与本机机器码不匹配（不是这台机器的注册码）' };
+  }
+  let sig;
+  try {
+    sig = base32Decode(parsed.sig32);
+  } catch (_) {
+    return { ok: false, reason: '注册码格式无效' };
+  }
+  if (sig.length !== 64) return { ok: false, reason: '注册码格式无效' };
+  // 用许可码内嵌的序列号重算被签消息，因此天然支持续期（序列号 >= 2）
+  const msg = Buffer.from(
+    `${LICENSE_PREFIX}-${parsed.machinePrefix}-${String(parsed.serial).padStart(4, '0')}`,
+    'utf8'
+  );
+  let good = false;
+  try {
+    good = crypto.verify(null, msg, publicKey(), sig);
+  } catch (_) {
+    good = false;
+  }
+  if (good) return { ok: true, serial: parsed.serial };
+  return { ok: false, reason: '注册码校验失败（签名不对，可能是伪造或输错）' };
 }
 
 // ---------- 授权状态（配额） ----------
@@ -252,16 +295,14 @@ class LicenseStore {
 
 module.exports = {
   LICENSE_PREFIX,
-  DEVELOPER_SECRET,
+  PUBLIC_KEY_HEX,
   TRIAL_LIMIT,
   LICENSE_LIMIT,
   MACHINE_RE,
-  LICENSE_RE,
   composeMachineCode,
   getMachineCode,
   forgetMachineCode,
   parseLicenseCode,
   verifyLicenseCode,
-  generateLicenseCode,
   LicenseStore,
 };

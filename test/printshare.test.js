@@ -268,34 +268,51 @@ test('未选打印机：任务保持排队等待，不判失败、不丢件', as
   assert.equal(fs.existsSync(current.file), true, '任务数据文件必须保留，选好打印机后还能继续打');
 });
 
-// ---------- 4. 注册授权（注册码与 PDFconvertAdd 通用） ----------
+// ---------- 4. 注册授权（Ed25519 非对称签名，注册码与 PDFconvertAdd 通用） ----------
 
-test('注册码：算法与 PDFconvertAdd 逐字一致（下面这组向量是 Python 生成器实跑结果）', () => {
+// DRYRUN 下 license.js 用固定组件算出固定的机器码；下面这组注册码是用**真实私钥**
+// 预先签好的（Ed25519 是确定性签名，所以这些字符串恒定不变）。
+// 测试因此不需要私钥，也能覆盖"有效注册码"这条路径；而程序里只有公钥，无法自造。
+const VEC_MACHINE = 'F8C3-EC7E-0AC8-7CF6';
+const VEC = {
+  1: 'PDF-F8C3EC7E-0001-RIOZAXVGWK64RLAPGC3R7BYV4FHUEPKWSTKS6QB5YSV74YUB62J4RNS6F2UJUN2CU2BVC3XCEN6QPDDNL2I6Y6LV4NNQZEO6O2MB6CY',
+  2: 'PDF-F8C3EC7E-0002-F3FLYVWDEURZF43FDGVYRSDONRXFBXHKHWODYVFSUXTBQA4JEKZYW6OO4M3RFETKTAQFOBZHA5FVDXDYOUMHGUKL5ZV6DUTFE3MEABQ',
+  3: 'PDF-F8C3EC7E-0003-JJDTRUYCH4BW3H3V2HFBVVCSSQLPLGWZKLECFX37RGTRYKAPPPNW2EDPIH45ARADG34T2AWEYZHY3XVH3F4VYD6NEWYNFNJY3OFGIDY',
+};
+
+test('注册码：机器码算法与 PDFconvertAdd 一致，且程序内只有公钥（无法自造码）', () => {
   const L = srv.licensing;
-  // 三组向量对得上 => 同一个生成器发的码在两个程序里都通用
-  assert.equal(L.generateLicenseCode('ABCD-1234-5678-9ABC', 1), 'PDF-ABCD1234-0001-FC9D7B30');
-  assert.equal(L.generateLicenseCode('ABCD-1234-5678-9ABC', 2), 'PDF-ABCD1234-0002-0D292615');
-  assert.equal(L.generateLicenseCode('ABCD-1234-5678-9ABC', 3), 'PDF-ABCD1234-0003-2B55BE4E');
-  // 机器码算法也必须一致：这套组件算出来要等于 Python get_machine_code.py 的输出
+  // 机器码算法必须与 Python 端 get_machine_code.py 完全一致，否则两边注册码不通用
   assert.equal(L.composeMachineCode({ board: 'Calla_LC', mac: 'C0:18:50:1B:85:11' }, 'x').code,
-    '56BA-91C4-AD56-9ACA', '机器码算法必须与 PDFconvertAdd 一致，否则两边注册码不通用');
+    '56BA-91C4-AD56-9ACA', '机器码算法必须与 PDFconvertAdd 一致');
+  assert.equal(L.composeMachineCode({ board: 'TEST_BOARD', mac: '00:11:22:33:44:55' }, 'testhost').code,
+    VEC_MACHINE, 'DRYRUN 机器码应与测试向量对应');
+  // 关键安全属性：随程序分发的 license.js 里**没有任何签发能力**
+  assert.equal(typeof L.generateLicenseCode, 'undefined', 'license.js 不得包含签发函数');
+  assert.equal(typeof L.DEVELOPER_SECRET, 'undefined', 'license.js 不得残留任何对称密钥');
+  assert.ok(L.PUBLIC_KEY_HEX && L.PUBLIC_KEY_HEX.length === 64, '应内置 32 字节公钥');
   assert.equal(L.LICENSE_LIMIT, 500, '每次注册授权可打印 500 份');
 });
 
-test('注册码：换机器码 / 改校验位 / 格式非法都要拒绝', () => {
+test('注册码：有效向量可验签；换机器码 / 篡改签名 / 旧格式都要拒绝', () => {
   const L = srv.licensing;
-  const good = L.generateLicenseCode('ABCD-1234-5678-9ABC', 7);
-  assert.equal(L.verifyLicenseCode(good, 'ABCD-1234-5678-9ABC').ok, true);
-  assert.equal(L.verifyLicenseCode(good, 'AAAA-BBBB-CCCC-DDDD').ok, false, '别的机器的码必须拒绝');
-  assert.equal(L.verifyLicenseCode('PDF-ABCD1234-0007-00000000', 'ABCD-1234-5678-9ABC').ok, false, '改校验位必须拒绝');
-  assert.equal(L.verifyLicenseCode('hello', 'ABCD-1234-5678-9ABC').ok, false, '格式非法必须拒绝');
-  assert.equal(L.verifyLicenseCode('', 'ABCD-1234-5678-9ABC').ok, false);
+  for (const s of [1, 2, 3]) {
+    const r = L.verifyLicenseCode(VEC[s], VEC_MACHINE);
+    assert.equal(r.ok, true, `serial ${s} 的向量应验签通过`);
+    assert.equal(r.serial, s);
+  }
+  assert.equal(L.verifyLicenseCode(VEC[1], 'AAAA-BBBB-CCCC-DDDD').ok, false, '别的机器的码必须拒绝');
+  const tampered = VEC[1].slice(0, -1) + (VEC[1].endsWith('A') ? 'B' : 'A');
+  assert.equal(L.verifyLicenseCode(tampered, VEC_MACHINE).ok, false, '篡改签名必须拒绝');
+  assert.equal(L.verifyLicenseCode('PDF-F8C3EC7E-0001-717DB684', VEC_MACHINE).ok, false, '旧 HMAC 格式必须拒绝');
+  assert.equal(L.verifyLicenseCode('hello', VEC_MACHINE).ok, false, '格式非法必须拒绝');
+  assert.equal(L.verifyLicenseCode('', VEC_MACHINE).ok, false);
 });
 
 test('授权状态机：试用用满 -> 注册 500 份 -> 续期必须换更大的序列号', () => {
   const L = srv.licensing;
   const file = path.join(DATA_DIR, 'lic-unit.json');
-  const store = new L.LicenseStore(file, 'ABCD-1234-5678-9ABC');
+  const store = new L.LicenseStore(file, VEC_MACHINE);
 
   const trial = store.status().allowance;
   assert.ok(trial >= 1, '未注册应有试用额度');
@@ -303,18 +320,17 @@ test('授权状态机：试用用满 -> 注册 500 份 -> 续期必须换更大�
   for (let i = 0; i < trial; i++) store.consume();
   assert.equal(store.canPrint(), false, '试用用满后不得再打印');
 
-  const code1 = L.generateLicenseCode('ABCD-1234-5678-9ABC', 1);
-  assert.equal(store.register(code1).ok, true, '试用用满后应能用序列号 1 注册');
+  assert.equal(store.register(VEC[1]).ok, true, '试用用满后应能用序列号 1 注册');
   assert.equal(store.status().trial, false);
   assert.equal(store.status().allowance, L.LICENSE_LIMIT, '注册后额度应为 500');
   assert.equal(store.status().used, 0, '注册后计数归零');
-  assert.equal(store.register(code1).ok, false, '同一张注册码不得重复使用');
-  assert.match(store.register(code1).reason, /已用到第 1 次/, '拒绝原因要说清该用更大的序列号');
+  assert.equal(store.register(VEC[1]).ok, false, '同一张注册码不得重复使用');
+  assert.match(store.register(VEC[1]).reason, /已用到第 1 次/, '拒绝原因要说清该用更大的序列号');
 
   for (let i = 0; i < L.LICENSE_LIMIT; i++) store.consume();
   assert.equal(store.canPrint(), false, '500 份用满后必须续期');
-  assert.equal(store.register(L.generateLicenseCode('ABCD-1234-5678-9ABC', 2)).ok, true, '更大序列号的新码可续期');
-  assert.equal(store.register(code1).ok, false, '续期后旧码不得回滚使用');
+  assert.equal(store.register(VEC[2]).ok, true, '更大序列号的新码可续期');
+  assert.equal(store.register(VEC[1]).ok, false, '续期后旧码不得回滚使用');
 
   fs.unlinkSync(file);
 });
@@ -331,10 +347,12 @@ test('授权闸门：配额用满后新任务被拒收并写明原因，续期�
   assert.match(blocked.error, /配额已用完/, '被拒收的任务必须写明原因，不能静默丢件');
   assert.equal(fs.existsSync(blocked.file), true, '被拒收的任务数据必须保留，续期后还能打');
 
-  // 用管理页给出的机器码 + 更大的序列号换取新注册码
+  // 服务端的机器码应等于测试向量对应的机器码
   const info = await srv.licensing.getMachineCode();
-  const code = srv.licensing.generateLicenseCode(info.code, (store.status().maxSerial || 0) + 1);
-  const r = await api('POST', '/api/license', { code });
+  assert.equal(info.code, VEC_MACHINE);
+  // 用更大的序列号续期（本机当前 maxSerial 为 0，故用序列号 1）
+  const serial = (store.status().maxSerial || 0) + 1;
+  const r = await api('POST', '/api/license', { code: VEC[serial] });
   assert.equal(r.json.ok, true, '有效注册码应注册成功：' + JSON.stringify(r.json));
   assert.ok(r.json.restored >= 1, '续期后应把被拒收的任务放回队列');
 
@@ -346,10 +364,10 @@ test('授权闸门：配额用满后新任务被拒收并写明原因，续期�
   await waitFor((q) => q.some((j) => j.id === job.id && j.status === 'done'), '续期后恢复打印');
 });
 
-test('注册接口：空注册码 / 无效注册码都要被拒绝', async () => {
+test('注册接口：空注册码 / 伪造注册码都要被拒绝', async () => {
   const empty = await api('POST', '/api/license', { code: '' });
   assert.equal(empty.status, 400);
-  const bad = await api('POST', '/api/license', { code: 'PDF-00000000-9999-00000000' });
+  const bad = await api('POST', '/api/license', { code: 'PDF-00000000-9999-' + 'A'.repeat(103) });
   assert.equal(bad.json.ok, false, '伪造注册码必须被拒绝');
   assert.ok(bad.json.reason, '拒绝时要给出原因');
 });

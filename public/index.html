@@ -70,7 +70,8 @@
     <h2>注册授权 <span class="badsmall" id="licBadge">读取中…</span></h2>
     <div class="hint" style="margin-bottom:12px">
       本机免费试用 <b id="licTrialN">20</b> 次打印；用完后需注册，<b>每次注册可打印 500 份</b>，用满后请用
-      <strong>新的注册码</strong>续期。注册码与 PDFconvertAdd 通用（同一套机器码与算法，本机机器码见下）。
+      <strong>新的注册码</strong>续期。注册码与 PDFconvertAdd 通用（同一套机器码与 Ed25519 签名算法）。<br>
+      注册码整串约 <b>121 个字符</b>（Ed25519 签名不可截断），请<strong>完整复制粘贴</strong>，不要手输。
     </div>
     <div id="licExhausted" style="display:none;color:var(--err);background:rgba(232,70,58,.08);border:1px solid rgba(232,70,58,.35);border-radius:8px;padding:10px 12px;margin-bottom:12px"></div>
     <div class="row" style="margin-bottom:10px">
@@ -83,7 +84,7 @@
       <span id="licState" class="hint"></span>
     </div>
     <div class="row">
-      <input id="licInput" class="code" placeholder="粘贴注册码，形如 PDF-XXXXXXXX-0000-XXXXXXXX">
+      <input id="licInput" class="code" placeholder="粘贴注册码（约 121 字符，形如 PDF-XXXXXXXX-0000-XXXX…）">
       <button class="big" id="licBtn">注册 / 续期</button>
     </div>
     <div class="hint" id="licMsg" style="margin-top:10px"></div>

@@ -21,3 +21,9 @@ license.json
 
 # 客户端安装脚本（运行期按需生成下载；若落到项目目录不入库）
 install-printer.bat
+
+# 许可签名私钥（Ed25519 发码用）——绝不入库、绝不进 exe。
+# 程序里只有公钥；私钥只留在开发者本机（默认在仓库外的 license-keys/ 目录）。
+license-private-key.json
+*private-key*.json
+license-keys/

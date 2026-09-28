@@ -97,6 +97,9 @@ before(async () => {
   process.env.PRINTSHARE_DATA_DIR = DATA_DIR;
   process.env.RAW_PORT = String(RAW_PORT);
   process.env.ADMIN_PORT = String(ADMIN_PORT);
+  // 给常规用例留足试用额度，免得它们被授权闸门挡住（授权闸门本身由最后的专项用例覆盖）。
+  // LICENSE_LIMIT 不覆盖，保持真实的 500，由"注册码"用例断言。
+  process.env.PRINTSHARE_TRIAL_LIMIT = '50';
   // 预置目标打印机：DRYRUN 下"投递"会立刻成功，用来造 done 任务
   fs.writeFileSync(path.join(DATA_DIR, 'config.json'),
     JSON.stringify({ printer: '__TestPrinter__', stripLang: false }));
@@ -251,7 +254,7 @@ test('管理页写接口：拒绝表单跨站提交与异站 Origin', async () =
   assert.equal(same.status, 200, '本机管理页的请求应正常放行');
 });
 
-// 放在最后：这一步会把"目标打印机"清空并恢复队列运行
+// 这一步会把"目标打印机"清空并恢复队列运行；紧随其后的授权用例会把打印机选回来
 test('未选打印机：任务保持排队等待，不判失败、不丢件', async () => {
   await api('POST', '/api/printer', { name: null });
   await api('POST', '/api/pause', { paused: false });
@@ -263,4 +266,90 @@ test('未选打印机：任务保持排队等待，不判失败、不丢件', as
   assert.equal(current.status, 'queued', '未设置打印机时应保持排队等待，而不是标记失败');
   assert.equal(current.printer, null);
   assert.equal(fs.existsSync(current.file), true, '任务数据文件必须保留，选好打印机后还能继续打');
+});
+
+// ---------- 4. 注册授权（注册码与 PDFconvertAdd 通用） ----------
+
+test('注册码：算法与 PDFconvertAdd 逐字一致（下面这组向量是 Python 生成器实跑结果）', () => {
+  const L = srv.licensing;
+  // 三组向量对得上 => 同一个生成器发的码在两个程序里都通用
+  assert.equal(L.generateLicenseCode('ABCD-1234-5678-9ABC', 1), 'PDF-ABCD1234-0001-FC9D7B30');
+  assert.equal(L.generateLicenseCode('ABCD-1234-5678-9ABC', 2), 'PDF-ABCD1234-0002-0D292615');
+  assert.equal(L.generateLicenseCode('ABCD-1234-5678-9ABC', 3), 'PDF-ABCD1234-0003-2B55BE4E');
+  // 机器码算法也必须一致：这套组件算出来要等于 Python get_machine_code.py 的输出
+  assert.equal(L.composeMachineCode({ board: 'Calla_LC', mac: 'C0:18:50:1B:85:11' }, 'x').code,
+    '56BA-91C4-AD56-9ACA', '机器码算法必须与 PDFconvertAdd 一致，否则两边注册码不通用');
+  assert.equal(L.LICENSE_LIMIT, 500, '每次注册授权可打印 500 份');
+});
+
+test('注册码：换机器码 / 改校验位 / 格式非法都要拒绝', () => {
+  const L = srv.licensing;
+  const good = L.generateLicenseCode('ABCD-1234-5678-9ABC', 7);
+  assert.equal(L.verifyLicenseCode(good, 'ABCD-1234-5678-9ABC').ok, true);
+  assert.equal(L.verifyLicenseCode(good, 'AAAA-BBBB-CCCC-DDDD').ok, false, '别的机器的码必须拒绝');
+  assert.equal(L.verifyLicenseCode('PDF-ABCD1234-0007-00000000', 'ABCD-1234-5678-9ABC').ok, false, '改校验位必须拒绝');
+  assert.equal(L.verifyLicenseCode('hello', 'ABCD-1234-5678-9ABC').ok, false, '格式非法必须拒绝');
+  assert.equal(L.verifyLicenseCode('', 'ABCD-1234-5678-9ABC').ok, false);
+});
+
+test('授权状态机：试用用满 -> 注册 500 份 -> 续期必须换更大的序列号', () => {
+  const L = srv.licensing;
+  const file = path.join(DATA_DIR, 'lic-unit.json');
+  const store = new L.LicenseStore(file, 'ABCD-1234-5678-9ABC');
+
+  const trial = store.status().allowance;
+  assert.ok(trial >= 1, '未注册应有试用额度');
+  assert.equal(store.status().trial, true);
+  for (let i = 0; i < trial; i++) store.consume();
+  assert.equal(store.canPrint(), false, '试用用满后不得再打印');
+
+  const code1 = L.generateLicenseCode('ABCD-1234-5678-9ABC', 1);
+  assert.equal(store.register(code1).ok, true, '试用用满后应能用序列号 1 注册');
+  assert.equal(store.status().trial, false);
+  assert.equal(store.status().allowance, L.LICENSE_LIMIT, '注册后额度应为 500');
+  assert.equal(store.status().used, 0, '注册后计数归零');
+  assert.equal(store.register(code1).ok, false, '同一张注册码不得重复使用');
+  assert.match(store.register(code1).reason, /已用到第 1 次/, '拒绝原因要说清该用更大的序列号');
+
+  for (let i = 0; i < L.LICENSE_LIMIT; i++) store.consume();
+  assert.equal(store.canPrint(), false, '500 份用满后必须续期');
+  assert.equal(store.register(L.generateLicenseCode('ABCD-1234-5678-9ABC', 2)).ok, true, '更大序列号的新码可续期');
+  assert.equal(store.register(code1).ok, false, '续期后旧码不得回滚使用');
+
+  fs.unlinkSync(file);
+});
+
+test('授权闸门：配额用满后新任务被拒收并写明原因，续期成功后自动恢复打印', async () => {
+  const store = await srv.licenseReady;
+  while (store.canPrint()) store.consume(); // 等价于"已经打满了配额"
+  assert.equal(store.canPrint(), false);
+
+  await api('POST', '/api/pause', { paused: false });
+  const job = await enqueueJob(Buffer.from('PCL-LIC-BLOCKED'), () => true, '任务入队');
+  const st = await waitFor((q) => q.some((j) => j.id === job.id && j.status === 'blocked'), '任务被拒收');
+  const blocked = st.queue.find((j) => j.id === job.id);
+  assert.match(blocked.error, /配额已用完/, '被拒收的任务必须写明原因，不能静默丢件');
+  assert.equal(fs.existsSync(blocked.file), true, '被拒收的任务数据必须保留，续期后还能打');
+
+  // 用管理页给出的机器码 + 更大的序列号换取新注册码
+  const info = await srv.licensing.getMachineCode();
+  const code = srv.licensing.generateLicenseCode(info.code, (store.status().maxSerial || 0) + 1);
+  const r = await api('POST', '/api/license', { code });
+  assert.equal(r.json.ok, true, '有效注册码应注册成功：' + JSON.stringify(r.json));
+  assert.ok(r.json.restored >= 1, '续期后应把被拒收的任务放回队列');
+
+  // 恢复打印：选上打印机后，之前被拒收的那条任务应能正常打完
+  // （DRYRUN 下 listPrinters() 只返回虚拟打印机，所以从接口取名字，别写死）
+  const printers = (await status()).printers || [];
+  assert.ok(printers.length, 'DRYRUN 下应至少有一个可选打印机');
+  await api('POST', '/api/printer', { name: printers[0] });
+  await waitFor((q) => q.some((j) => j.id === job.id && j.status === 'done'), '续期后恢复打印');
+});
+
+test('注册接口：空注册码 / 无效注册码都要被拒绝', async () => {
+  const empty = await api('POST', '/api/license', { code: '' });
+  assert.equal(empty.status, 400);
+  const bad = await api('POST', '/api/license', { code: 'PDF-00000000-9999-00000000' });
+  assert.equal(bad.json.ok, false, '伪造注册码必须被拒绝');
+  assert.ok(bad.json.reason, '拒绝时要给出原因');
 });

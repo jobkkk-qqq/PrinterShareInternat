@@ -16,6 +16,8 @@ dist/
 queue/*
 !queue/.gitkeep
 config.json
+# 授权状态（本机机器码 / 注册码 / 已打印计数），属运行期数据
+license.json
 
 # 客户端安装脚本（运行期按需生成下载；若落到项目目录不入库）
 install-printer.bat

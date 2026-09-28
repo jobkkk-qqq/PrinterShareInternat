@@ -47,6 +47,9 @@
   code{background:var(--soft);border-radius:6px;padding:1px 7px;font-family:Consolas,monospace;font-size:15px}
   .badsmall{padding:2px 10px;border-radius:999px;background:var(--soft);color:var(--muted);font-size:13px}
   .pri{font-family:Consolas,monospace;font-weight:600}
+  input.code{font-size:17px;padding:11px 12px;border:1px solid var(--line);border-radius:8px;flex:1;min-width:260px;background:#fff;font-family:Consolas,monospace}
+  .pill.blocked{background:rgba(239,170,23,.18);color:#9a6b00}
+  .okline{color:#0c8a5b}
 </style>
 </head>
 <body>
@@ -61,6 +64,30 @@
       <select id="printerSelect"></select>
       <button class="big" id="applyBtn">保存</button>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>注册授权 <span class="badsmall" id="licBadge">读取中…</span></h2>
+    <div class="hint" style="margin-bottom:12px">
+      本机免费试用 <b id="licTrialN">20</b> 次打印；用完后需注册，<b>每次注册可打印 500 份</b>，用满后请用
+      <strong>新的注册码</strong>续期。注册码与 PDFconvertAdd 通用（同一套机器码与算法，本机机器码见下）。
+    </div>
+    <div id="licExhausted" style="display:none;color:var(--err);background:rgba(232,70,58,.08);border:1px solid rgba(232,70,58,.35);border-radius:8px;padding:10px 12px;margin-bottom:12px"></div>
+    <div class="row" style="margin-bottom:10px">
+      <span style="white-space:nowrap">本机机器码:</span>
+      <code id="licMachine" style="flex:1;min-width:260px;user-select:all">读取中…</code>
+      <button class="ghost" id="licCopyBtn">复制</button>
+    </div>
+    <div class="row" style="margin-bottom:10px">
+      <span style="white-space:nowrap">授权状态:</span>
+      <span id="licState" class="hint"></span>
+    </div>
+    <div class="row">
+      <input id="licInput" class="code" placeholder="粘贴注册码，形如 PDF-XXXXXXXX-0000-XXXXXXXX">
+      <button class="big" id="licBtn">注册 / 续期</button>
+    </div>
+    <div class="hint" id="licMsg" style="margin-top:10px"></div>
+    <div class="hint" style="margin-top:8px">把上面的机器码发给开发者换取注册码。同一台机器每次续期都会拿到<b>不一样的</b>注册码，旧码不能重复使用。</div>
   </div>
 
   <div class="card">
@@ -120,7 +147,7 @@
 </div>
 
 <script>
-  var state = { paused:false, printers:[], targetPrinter:null, queue:[], serverIPs:[], preferredIP:null, stripLang:false, printLog:true };
+  var state = { paused:false, printers:[], targetPrinter:null, queue:[], serverIPs:[], preferredIP:null, stripLang:false, printLog:true, license:null };
   var printerTouched = false; // 用户是否手动改过打印机下拉（防止 2.5s 刷新把手选值顶回去）
 
   function $(id){ return document.getElementById(id); }
@@ -128,7 +155,7 @@
   function fmtBytes(b){ return b? (b/1024).toFixed(1)+' KB' : '0 B'; }
 
   function statusPill(j){
-    var map = { queued:{c:'q',t:'排队中'}, printing:{c:'p',t:'打印中'}, done:{c:'done',t:'已完成'}, failed:{c:'fail',t:'失败'}, cancelled:{c:'cancelled',t:'已取消'} };
+    var map = { queued:{c:'q',t:'排队中'}, printing:{c:'p',t:'打印中'}, done:{c:'done',t:'已完成'}, failed:{c:'fail',t:'失败'}, cancelled:{c:'cancelled',t:'已取消'}, blocked:{c:'blocked',t:'已拒收'} };
     var m = map[j.status] || map.queued;
     var txt = j.paused ? '排队中(已暂停)' : m.t;
     return '<span class="pill ' + m.c + '">' + txt + '</span>';
@@ -163,6 +190,24 @@
       var r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:body?JSON.stringify(body):undefined});
       return await r.json();
     } catch(e){ return {ok:false}; }
+  }
+
+  // ---- 注册授权面板 ----
+  function renderLicense(){
+    var L = state.license;
+    if(!L) return;
+    $('licTrialN').textContent = L.trialLimit;
+    $('licBadge').textContent = L.registered ? ('已注册 · 第 ' + L.serial + ' 次授权') : '试用中';
+    $('licState').textContent = (L.registered ? '本授权' : '试用') + '已打印 ' + L.used + ' / ' + L.allowance +
+      ' 份（剩余 ' + L.remaining + ' 份）';
+    if(L.machineCode) $('licMachine').textContent = L.machineCode;
+    var ex = $('licExhausted');
+    if(!L.canPrint){
+      ex.style.display = 'block';
+      ex.textContent = L.registered
+        ? '⚠ 本授权额度已用完（' + L.used + '/' + L.allowance + '），新打印任务已被拒收并留在队列里。请用序列号大于 ' + L.maxSerial + ' 的新注册码续期，续期成功后会自动恢复打印。'
+        : '⚠ 免费试用次数已用完（' + L.used + '/' + L.allowance + '），新打印任务已被拒收并留在队列里。注册成功后会自动恢复打印。';
+    } else ex.style.display = 'none';
   }
 
   function render(){
@@ -204,6 +249,7 @@
       lw.style.display = 'block';
       lw.textContent = '⚠ 打印服务操作日志未开启，无法核对打印是否真正送达打印机：列表里的「已完成」仅表示数据已交给后台，请以打印机实际出纸为准。重启本程序会自动请求授权开启。';
     } else lw.style.display = 'none';
+    renderLicense();
     $('pauseBtn').textContent = state.paused ? '▶ 继续队列' : '⏸ 全局暂停';
     // 协商前导统计与开关
     var langN = state.queue.filter(function(j){ return langFlagsOf(j).length; }).length;
@@ -221,6 +267,8 @@
         ops += '<button class="danger" data-c="'+j.id+'">取消</button>';
       }
       if(j.status==='printing') ops = '<span class="hint">打印中…</span>';
+      // 配额用完被拒收：黄色直显原因，并说明注册后会自动恢复（不静默丢件）
+      if(j.status==='blocked' && j.error) ops = '<span class="noteline" title="'+esc(j.error)+'">'+esc(shortErr(j.error))+'</span>';
       if(j.status==='failed' && j.error) ops = '<span class="failline" title="'+esc(j.error)+'">'+esc(shortErr(j.error))+'</span>';
       // 已完成但未核对：把"为什么没核对上"直接写出来，不让人以为万事大吉
       if(j.status==='done' && j.verified===false) ops = '<span class="noteline" title="'+esc(j.note)+'">'+esc(shortErr(j.note||'未能核对真实打印结果'))+'</span>';
@@ -258,6 +306,38 @@
   $('clearBtn').addEventListener('click', function(){ api('/api/clear-done'); });
   $('stripBtn').addEventListener('click', function(){ api('/api/strip-lang',{stripLang:!state.stripLang}); });
 
+  // ---- 注册授权 ----
+  $('licCopyBtn').addEventListener('click', async function(){
+    var msg = $('licMsg');
+    try {
+      await navigator.clipboard.writeText($('licMachine').textContent || '');
+      msg.textContent = '机器码已复制，发给开发者即可换取注册码。';
+      msg.className = 'hint okline';
+    } catch(e){
+      msg.textContent = '复制失败，请手动选中机器码复制。';
+      msg.className = 'hint';
+    }
+  });
+  $('licBtn').addEventListener('click', async function(){
+    var msg = $('licMsg');
+    var code = ($('licInput').value || '').trim();
+    if(!code){ msg.textContent = '请先粘贴注册码。'; msg.className = 'hint'; return; }
+    $('licBtn').disabled = true; $('licBtn').textContent = '注册中…';
+    var r = await api('/api/license', {code:code});
+    $('licBtn').disabled = false; $('licBtn').textContent = '注册 / 续期';
+    if(r && r.ok){
+      msg.textContent = '注册成功！已启用第 ' + r.serial + ' 次授权，额度 ' +
+        ((r.license && r.license.allowance) || 500) + ' 份' +
+        (r.restored ? ('，已恢复 ' + r.restored + ' 个被拒收的任务') : '') + '。';
+      msg.className = 'hint okline';
+      $('licInput').value = '';
+      refreshLicense(); refresh();
+    } else {
+      msg.textContent = '注册失败：' + ((r && r.reason) || '未知原因');
+      msg.className = 'hint failline';
+    }
+  });
+
   function downloadBlob(blob, name){
     var a = document.createElement('a');
     a.href = URL.createObjectURL(blob); a.download = name;
@@ -288,6 +368,7 @@
       state.paused = st.paused; state.printers = st.printers||[];
       state.stripLang = !!st.stripLang;
       state.printLog = st.printLog !== false;
+      state.license = st.license || state.license;
       state.targetPrinter = st.targetPrinter; state.defaultPrinter = st.defaultPrinter;
       state.queue = st.queue||[];
       state.serverIPs = st.serverIPs||[];
@@ -296,7 +377,16 @@
     } catch(e){ /* 服务器可能还没起来 */ }
   }
 
+  // 机器码与完整授权信息（/api/status 里只带精简授权字段）
+  async function refreshLicense(){
+    try {
+      var st = await (await fetch('/api/license')).json();
+      if(st && st.machineCode){ state.license = Object.assign({}, state.license, st); renderLicense(); }
+    } catch(e){ /* 服务器可能还没起来 */ }
+  }
+
   refresh();
+  refreshLicense();
   setInterval(refresh, 2500);
 </script>
 </body>

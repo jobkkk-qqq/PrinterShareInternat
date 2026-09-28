@@ -13,7 +13,7 @@
   <img alt="Windows" src="https://img.shields.io/badge/Platform-Windows%207%2F8%2F10%2F11-blue?logo=windows&logoColor=white">
   <img alt="Node" src="https://img.shields.io/badge/Node.js-%E2%89%A5%2018-green?logo=node.js&logoColor=white">
   <img alt="Electron" src="https://img.shields.io/badge/Electron-31-purple?logo=electron&logoColor=white">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.2.2-orange">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.3.0-orange">
   <img alt="License" src="https://img.shields.io/badge/License-MIT-lightgrey">
   <img alt="Type3 raw" src="https://img.shields.io/badge/协议-RAW%20(TCP%209100)-informational">
 </p>
@@ -47,6 +47,9 @@
   核对不了时在列表里明确标注「未核对」，绝不静默当成成功
 - ✅ **非物理端口守卫**：目标队列端口是文件路径 / `PORTPROMPT:` / `nul:` 时直接判失败并说明原因，
   避免"显示已完成、打印机却不动"的假成功
+- ✅ **注册授权（每 500 份续期）**：未注册可免费打印 **20 份**；注册后**每次授权 500 份**，用满需用
+  **新的注册码**续期。只统计**成功打印**的份数；配额用满时新任务被拒收并写明原因，续期成功后自动恢复打印。
+  注册码与 [PDFconvertAdd](#注册授权每-500-份续期) 通用
 - ✅ **零依赖回归测试**：`npm test` 覆盖队列投递、清空已完成、客户端脚本生成（Node 内置 test runner，不用装测试框架）
 
 ## 工作原理
@@ -80,6 +83,54 @@
    字节原样透传给设备。管理页里你选的仍是物理打印机（它决定客户端该装哪个驱动），注入目标在服务端自动改写。
 3. **非物理端口守卫**：若目标队列的端口是文件路径、`PORTPROMPT:`（Microsoft Print to PDF）或 `nul:`，
    内容根本到不了打印机，程序直接判失败并提示改选真实打印机，而不是让它伪装成「已完成」。
+
+### 注册授权（每 500 份续期）
+
+程序带一个轻量授权闸门，用来实现"每打印 500 份文件就要重新注册"：
+
+| 阶段 | 额度 | 说明 |
+| --- | --- | --- |
+| 未注册（试用） | **20 份** | 装好即可用，用满必须注册 |
+| 已注册（每次授权） | **500 份** | 用满需用新的注册码续期 |
+
+- **只算成功的份数**：投递失败 / 卡纸 / 端口错误都不扣。核对不到真实结果时（打印服务日志未开启）按投递成功计——
+  否则只要关掉日志就能无限白嫖，配额形同虚设。
+- **用满后的行为**：新任务**不投递给打印机**，但会留在队列里并明确标注「已拒收：配额已用完…」；
+  续期成功后自动放回队列继续打印，不会静默丢件。
+- **注册码与 PDFconvertAdd 通用**：同一套机器码算法、同一个签名密钥、同一种四段格式：
+
+  ```
+  PDF - XXXXXXXX - NNNN - YYYYYYYY
+         │          │       └─ HMAC-SHA256(密钥, "PDF-{前缀}-{序列号}") 前 8 位
+         │          └─ 序列号（第几次授权）—— 续期就把它 +1
+         └─ 机器码前 8 位（绑定机器）
+  ```
+
+  所以**同一个生成器**既能为 PDFconvertAdd 发码，也能为本程序发码：本仓库的 `gen-license.js` 与
+  PDFconvertAdd 的 `licensing/scripts/generate_license.py` 输出**逐字符一致**（已交叉验证）。
+
+**发码 / 续期流程**
+
+1. 主机打开管理页，在「注册授权」卡片里**复制本机机器码**（形如 `56BA-91C4-AD56-9ACA`）发给开发者；
+2. 开发者用该机器码生成注册码：
+
+   ```bash
+   node gen-license.js 56BA-91C4-AD56-9ACA            # 序列号 1，首次注册（500 份）
+   node gen-license.js 56BA-91C4-AD56-9ACA 2          # 序列号 2，第二次续期
+   node gen-license.js 56BA-91C4-AD56-9ACA --count 5  # 一次备好序列号 1..5
+   # 等价（Python）：python generate_license.py 56BA-91C4-AD56-9ACA 2
+   ```
+
+3. 把注册码粘回管理页「注册 / 续期」并保存即可。
+
+> **序列号必须一次比一次大。** 程序记录本机用过的最大序列号，只接受序列号更大的注册码。这既保证
+> "过期后拿到的注册码跟上一张不一样"，也让旧码无法被重复使用或回滚。
+
+> **机器码怎么算的**：`SHA256("CPU:x|BOARD:x|MAC:x|HDD:x")` 取前 16 位十六进制。为了与 PDFconvertAdd
+> **完全一致**，MAC 取自 CPython `uuid.getnode()` 在 Windows 上的同一来源 `UuidCreateSequential`
+> （主网卡地址），而不是"当前联网的那块网卡"。CPU / 硬盘序列号依赖 `wmic`，而 Win11 24H2 起微软已移除
+> `wmic`，所以新系统上机器码通常只由 **主板型号 + 网卡** 组成（PDFconvertAdd 在这些机器上同样如此）。
+> 换主板或换网卡会导致机器码变化、已发的注册码失效，需要重新发码。
 
 ## 快速开始（用打包好的 exe）
 
@@ -153,6 +204,9 @@ set DRYRUN=1   # 然后 node server.js
 | `ADMIN_BIND` | 管理页监听地址（环境变量）；设 `0.0.0.0` 才允许局域网访问管理页 | `127.0.0.1`（仅本机） |
 | `PRINTSHARE_DATA_DIR` | 队列 / 配置目录（环境变量，优先级最高） | 源码运行=项目目录；打包运行=`%APPDATA%\PrintShare` |
 | `config.json` | 目标打印机名（首次运行自动创建，可缺省） | 自动取默认打印机 |
+| `license.json` | 授权状态（机器码、注册码、已打印计数）；删掉它等于退回"未注册试用" | 自动创建 |
+| `PRINTSHARE_TRIAL_LIMIT` | 未注册时的免费试用份数（环境变量） | `20` |
+| `PRINTSHARE_LICENSE_LIMIT` | 每次注册授权可打印的份数（环境变量） | `500` |
 | `queue/` | 磁盘暂存的任务队列；`meta.json` 存元数据 | 自动创建 |
 
 > **数据放哪？** 源码方式运行（`npm start` / `npm run electron`）时，`config.json` 与 `queue/` 就在项目目录下；
@@ -195,11 +249,14 @@ server.js          核心打印服务：TCP 9100 收流 → 磁盘队列 → 串
                    （含直通队列自动改写、非物理端口守卫、投递后结果核对）
 winspool.ps1       PowerShell P/Invoke，把数据交给本机打印机（零原生依赖，含前导0剥离）
 printcheck.ps1     读打印服务操作日志，核对作业是否真正送达打印机端口
-public/index.html  Web 管理页：打印机选择、队列可视化、客户端脚本生成
+license.js         注册授权：机器码计算 + 注册码验签 + 授权/配额状态机（与 PDFconvertAdd 通用）
+machinecode.ps1    采集硬件组件算机器码（MAC 用 UuidCreateSequential，与 CPython 一致）
+gen-license.js     开发者发码工具：按机器码 + 序列号生成注册码（与 Python 生成器输出一致）
+public/index.html  Web 管理页：打印机选择、注册授权、队列可视化、客户端脚本生成
 make-icon.js       生成托盘/应用图标（ico/png）
 build.bat          一键打包脚本（内置镜像与缓存路径）
 start-server.bat   一键启动脚本（纯 ASCII，检测 Node、放行防火墙、打开管理页）
-test/              零依赖回归测试（node --test：队列 / 清空已完成 / 客户端脚本生成）
+test/              零依赖回归测试（node --test：队列 / 清空已完成 / 客户端脚本 / 注册授权）
 ```
 
 ## ❓ 常见问题
@@ -217,6 +274,13 @@ test/              零依赖回归测试（node --test：队列 / 清空已完�
      "XPS 管道型"**（如 HP DJ 1110），RAW 数据让 `printfilterpipelinesvc` 崩溃（`0x80004005`）——本版会自动
      改投同端口的直通队列绕开；**打印后台卡死**（多次管道崩溃后常见）——重启 Print Spooler 服务、清掉残留
      `.SPL` 后重试；**硬件问题**——缺纸 / 缺墨盒 / 固件卡死（HP 低端喷墨可断电 40–60 秒再上电）。
+- **提示「已拒收：本机打印配额已用完」/ 突然打不出来了**：本机授权份数用完了。未注册免费 20 份，
+  注册后每次授权 500 份。到管理页「注册授权」卡片**复制机器码** → 发给开发者换取**新的**注册码
+  （序列号要比上一张更大）→ 粘回「注册 / 续期」保存。被拒收的任务会自动恢复打印，数据没丢。
+- **注册码提示「本机已用到第 N 次」或「与本机机器码不匹配」**：① 用了旧码——续期必须用**序列号更大**的
+  新注册码；② 机器码变了（换主板 / 换网卡 / 把 exe 换到另一台机器跑）——旧码绑定的是原机器码，需按新机器码重新发码。
+- **机器码与 PDFconvertAdd 显示的不一样**：正常情况下两者应当一致（同一套算法）。若硬件信息取不到，
+  会退化成按主机名算的 `FALLBACK` 值，这种值可能随机器名变化而不稳定，建议检查 PowerShell 是否被杀软拦截。
 - **纸张顶部打印出 `284.4@EJL`（爱普生）/ `@PJL`（HP）等乱码，正文被下推**：驱动与打印机之间的
   **作业语言协商**没对上，详见下方[《驱动 ↔ 打印机协商问题》](#驱动--打印机协商问题纸面乱码--正文下移)。
 - **install-printer.bat 在 Windows 7 下闪退 / 报「不是内部或外部命令」**：旧版脚本有两个问题：
@@ -271,11 +335,36 @@ test/              零依赖回归测试（node --test：队列 / 清空已完�
 - [x] 前导 0 剥离修复
 - [x] 驱动协商兼容：EJL / PJL / UEL 前导检测与可选剥离（爱普生 / HP / 佳能）
 - [x] 打印结果如实核对（打印服务日志）+ 直通队列自动改写 + 非物理端口守卫
+- [x] 注册授权：未注册试用 20 份、每次授权 500 份，用满需凭新注册码续期（注册码与 PDFconvertAdd 通用）
 - [x] 零依赖回归测试（`npm test`：队列投递 / 清空已完成 / 客户端脚本生成）
 - [ ] 打印页数 / 耗材状态上报
 - [ ] 打印机多实例 / 一台主机管理多台打印机
 
 ## 📝 更新日志
+
+### 0.3.0
+
+**新增 · 注册授权（每 500 份续期，注册码与 PDFconvertAdd 通用）**
+
+- **授权闸门**：未注册免费试用 **20 份**；注册后**每次授权 500 份**，用满必须凭**新的注册码**续期。
+  额度可用 `PRINTSHARE_TRIAL_LIMIT` / `PRINTSHARE_LICENSE_LIMIT` 调整。
+- **只计成功打印**：投递失败 / 卡纸 / 端口错误都不扣次数；只有确认打印成功才 +1。
+  （核对不到真实结果时按投递成功计，否则关掉打印服务日志就能绕过配额。）
+- **用满即拒收但不丢件**：新任务不投递给打印机，在队列里标注「已拒收：本机打印配额已用完…」；
+  **续期成功后自动放回队列继续打印**。
+- **注册码与 PDFconvertAdd 完全通用**：同一套机器码算法、同一个签名密钥、同一种四段格式
+  `PDF-XXXXXXXX-NNNN-YYYYYYYY`，其中 `NNNN` 是序列号（第几次授权）——续期就是把它 +1，
+  因此每次续期拿到的注册码都不同，旧码也无法重复使用。本仓库 `gen-license.js` 与 PDFconvertAdd 的
+  `generate_license.py` 输出**逐字符一致**（已用真实机器码交叉验证）。
+- **序列号必须递增**：程序记录本机用过的最大序列号，只接受更大的序列号，杜绝旧码回滚复用。
+- **机器码与 PDFconvertAdd 一致**：MAC 改用 `UuidCreateSequential`（即 CPython `uuid.getnode()` 在 Windows
+  上的同一来源），而非"当前联网的网卡"，两个程序在同一台机器上算出同一个机器码。
+- **管理页新增「注册授权」卡片**：显示 / 复制机器码、当前授权与剩余份数、注册码输入与续期，
+  额度用满时给出醒目提示。
+
+**变更**
+
+- 管理页新增「已拒收」任务状态（配额用满时）。
 
 ### 0.2.2
 

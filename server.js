@@ -17,6 +17,8 @@ const { promisify } = require('util');
 
 const execFileP = promisify(execFile);
 
+const licensing = require('./license.js');
+
 const DRYRUN = process.env.DRYRUN === '1'; // 测试用：只走队列流程，不真投 lp 弹窗
 const PS = 'powershell';
 const PS_OPTS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass'];
@@ -46,6 +48,8 @@ const DATA_ROOT = process.env.PRINTSHARE_DATA_DIR
 
 const QUEUE_DIR = path.join(DATA_ROOT, 'queue');
 const META_FILE = path.join(QUEUE_DIR, 'meta.json');
+// 授权状态（机器码绑定 + 已打印计数）。与队列分开存：清空"已完成"任务不会动配额。
+const LICENSE_FILE = path.join(DATA_ROOT, 'license.json');
 
 const CONFIG = {
   rawPort: Number(process.env.RAW_PORT) || 9100,
@@ -66,6 +70,47 @@ let stripLang = false; // 是否在转发前剥离作业语言前导（PJL/EJL/U
 let jobs = []; // 任务数组（内存中的元数据，数据本体在磁盘）
 let seq = 0;
 let pumping = false;
+
+// ---------- 授权（注册码 + 配额） ----------
+// 需要先取机器码（要起一次 PowerShell），所以放到异步 ready 里。凡是用到配额的地方
+// 都先 await 它，避免开机瞬间的作业绕过授权闸门。
+let licenseStore = null;
+const licenseReady = (async () => {
+  try {
+    const info = await licensing.getMachineCode();
+    licenseStore = new licensing.LicenseStore(LICENSE_FILE, info.code);
+    const s = licenseStore.status();
+    console.log(`[授权] 机器码 ${info.code}（${info.components.join(' | ')}）`);
+    console.log(`[授权] ${s.registered ? `已注册 · 第 ${s.serial} 次授权` : '未注册 · 试用中'}：已用 ${s.used}/${s.allowance} 次`);
+  } catch (e) {
+    // 硬件查询失败不该让整个服务起不来：退化为一个确定的机器码继续跑
+    console.error('[授权] 初始化失败，本次运行按未注册试用处理：', e.message);
+    licenseStore = new licensing.LicenseStore(LICENSE_FILE, '0000-0000-0000-0000');
+  }
+  return licenseStore;
+})();
+
+function licenseStatus() {
+  return licenseStore ? licenseStore.status() : null;
+}
+
+// 配额用满时把所有待打任务标成"已拒收"：数据仍在磁盘，管理页看得见原因，
+// 续期成功后自动放回队列继续打印（不静默丢件）。
+function blockQueuedJobs(reason) {
+  let n = 0;
+  for (const j of jobs) {
+    if (j.status === 'queued' && !j.paused) { j.status = 'blocked'; j.error = reason; n++; }
+  }
+  return n;
+}
+
+function unblockJobs() {
+  let n = 0;
+  for (const j of jobs) {
+    if (j.status === 'blocked') { j.status = 'queued'; j.error = null; n++; }
+  }
+  return n;
+}
 
 // ---------- 防火墙自动放行（单文件部署免手动配置） ----------
 // 检测放行规则是否存在，缺失时弹一次 UAC 授权自动添加，保证客户端 9100 / 管理页端口可被局域网访问。
@@ -448,6 +493,20 @@ async function pump() {
       const job = nextJob();
       if (!job) break;
 
+      // 授权闸门：未注册只有 TRIAL_LIMIT 次试用，注册后每次授权 LICENSE_LIMIT 次。
+      // 用满时新任务一律拒收（不投递给打印机），但在队列里标明原因——数据还在磁盘，
+      // 续期成功后自动放回队列继续打印，不会静默丢件。
+      const lic = await licenseReady;
+      if (lic && !lic.canPrint()) {
+        const s = lic.status();
+        const reason = `已拒收：本机打印配额已用完（${s.used}/${s.allowance}），请在管理页用新的注册码续期后再打印`;
+        if (blockQueuedJobs(reason)) {
+          persist();
+          console.warn(`[授权] ${reason}`);
+        }
+        break;
+      }
+
       if (!job.printer) job.printer = targetPrinter || (await defaultPrinter());
       if (!job.printer) {
         // 不要直接判失败：任务数据还在，用户在管理页选好打印机后（/api/printer 会调用
@@ -484,6 +543,13 @@ async function pump() {
       //（日志未开启/查不到该作业），管理页必须据此标注"未核对"，不能当成已确认。
       job.verified = r.verified === true;
       job.note = r.note || null;
+      // 只有确认打印成功才扣配额（失败/卡纸不扣）。核对不了（verified=false）时按投递成功计，
+      // 否则只要关掉打印服务日志就能白嫖无限次，配额形同虚设。
+      if (r.ok && lic) {
+        const after = lic.consume();
+        job.licenseUsed = after.used;
+        if (!after.canPrint) console.warn(`[授权] 配额已用满（${after.used}/${after.allowance}），后续任务将被拒收，请在管理页续期`);
+      }
       persist();
       if (r.ok) console.log(`[队列] 完成   任务#${job.seq} -> ${job.verified ? '已确认送达打印机' : `已投递但未核对（${job.note || '未知原因'}）`}`);
       else console.warn(`[队列] 失败   任务#${job.seq} -> ${job.error}`);
@@ -1043,7 +1109,36 @@ const adminServer = http.createServer(async (req, res) => {
     // 后台异步补一次检测（printLogState 自带 TTL 缓存）。
     if (printLogEnabled === null) printLogState().catch(() => {});
     const printLog = printLogEnabled !== false;
-    return sendJson(res, { rawPort: CONFIG.rawPort, adminPort: CONFIG.adminPort, targetPrinter, defaultPrinter: def, printers, paused: globalPaused, stripLang, serverIPs: serverIPs(), preferredIP, queue, printLog });
+    const lic = await licenseReady;
+    return sendJson(res, { rawPort: CONFIG.rawPort, adminPort: CONFIG.adminPort, targetPrinter, defaultPrinter: def, printers, paused: globalPaused, stripLang, serverIPs: serverIPs(), preferredIP, queue, printLog, license: lic ? lic.status() : null });
+  }
+
+  // 注册码信息：机器码 + 当前授权/配额状态（机器码只在这里给出，供复制给开发者发码）
+  if (url === '/api/license' && method === 'GET') {
+    const lic = await licenseReady;
+    const info = await licensing.getMachineCode();
+    return sendJson(res, Object.assign({ ok: true, components: info.components }, lic ? lic.status() : {}));
+  }
+
+  // 注册 / 续期：校验注册码（机器码绑定 + HMAC 校验位），并要求序列号严格大于本机用过的最大值，
+  // 因此同一张码不能用第二次，续期必须换新码。
+  if (url === '/api/license' && method === 'POST') {
+    let body = ''; req.on('data', (c) => (body += c));
+    return req.on('end', async () => {
+      let code = '';
+      try { code = String(JSON.parse(body).code || '').trim(); } catch (_) { /* 非法 JSON，按空处理 */ }
+      if (!code) return sendJson(res, { ok: false, reason: '请输入注册码' }, 400);
+      const lic = await licenseReady;
+      const r = lic.register(code);
+      if (!r.ok) return sendJson(res, { ok: false, reason: r.reason });
+      // 续期成功：把之前"已拒收"的任务放回队列，立即恢复打印
+      const restored = unblockJobs();
+      persist();
+      console.log(`[授权] 注册成功 · 第 ${r.serial} 次授权，额度 ${r.status.allowance} 次` +
+        (restored ? `，已恢复 ${restored} 个被拒收任务` : ''));
+      pump();
+      return sendJson(res, { ok: true, serial: r.serial, restored, license: r.status });
+    });
   }
 
   if (url === '/api/printer' && method === 'POST') {
@@ -1163,9 +1258,22 @@ ensureDirs();
 cleanOrphanIngest();
 loadState();
 pump(); // 重启后继续处理队列里未完成的任务
+// 授权就绪后：若配额仍可用，把上次运行遗留的"已拒收"任务放回队列（等到注册才恢复）
+licenseReady.then((lic) => {
+  if (lic && lic.canPrint() && unblockJobs()) {
+    persist();
+    console.log('[授权] 配额可用，已恢复此前被拒收的任务');
+    pump();
+  }
+}).catch(() => {});
 ensureFirewall(); // 自动放行防火墙（首次运行会弹一次 UAC）
 ensurePrintLog(); // 自动开启打印服务操作日志（核对打印结果用，默认关闭时弹一次 UAC）
 if (DRYRUN) console.log('[提示] DRYRUN=1：只走队列流程，不真正打印');
 
 // tcpServer / adminServer 也导出：自动化测试要能在同一个进程里把服务关掉
-module.exports = { buildClientScript, brandOf, tipBlock, scanJobLanguage, stripJobLanguage, langFlags, tcpServer, adminServer };
+module.exports = {
+  buildClientScript, brandOf, tipBlock, scanJobLanguage, stripJobLanguage, langFlags,
+  tcpServer, adminServer,
+  // 授权：自动化测试要能直接驱动配额（耗尽/续期）来验证闸门与恢复
+  licensing, licenseReady, LICENSE_FILE, blockQueuedJobs, unblockJobs, pump,
+};
